@@ -78,6 +78,25 @@ export interface ChatMessagesParams {
   is_from_me?: boolean
   start_time?: string
   end_time?: string
+
+  /**
+   * Opt in to embedding each message's stored AI diagnostics payload
+   * (`metadata_debug`) with the page (reference §08).
+   *
+   * **Deliberately not the wire spelling.** The reference's rule is that the
+   * parameter is sent as `true` or **not sent at all** — never `false` — and a
+   * rule stated in prose is a rule that decays. `getChatMessages` below performs
+   * the translation, so the wire name `include_debug` exists in this file and
+   * nowhere else in `src/`, and `src/lib/source-policy.test.ts` fails the build
+   * if a second file ever spells it.
+   *
+   * The flag is ANDed with `messages.debug.read` by the backend: a caller
+   * without that permission passing it is **ignored silently**, with no 403 and
+   * the debug fields simply absent. So the UI never sends it without the
+   * permission — a control that fires a request which can never answer is a
+   * control that looks broken.
+   */
+  includeDebug?: boolean
 }
 
 const enc = encodeURIComponent
@@ -86,9 +105,15 @@ export function listChats(params: ListChatsParams) {
   return results<{ data: ChatInfo[]; pagination: Pagination }>(http.get('/chats', { params }))
 }
 
-export function getChatMessages(chatJid: string, params: ChatMessagesParams) {
+export function getChatMessages(chatJid: string, { includeDebug, ...params }: ChatMessagesParams) {
   return results<{ data: MessageInfo[]; pagination: Pagination; chat_info: ChatInfo }>(
-    http.get(`/chat/${enc(chatJid)}/messages`, { params }),
+    http.get(`/chat/${enc(chatJid)}/messages`, {
+      // `true`, or the key carries `undefined` and axios drops it from the query
+      // string entirely. `false` is never sent: §08 describes an opt-in whose
+      // absence is the off state, and a literal `include_debug=false` would be
+      // this UI asserting a shape the reference does not describe.
+      params: { ...params, include_debug: includeDebug ? true : undefined },
+    }),
   )
 }
 

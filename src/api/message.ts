@@ -60,3 +60,30 @@ export function downloadMedia(messageId: string, phone: string) {
     http.get(`/message/${enc(messageId)}/download`, { params: { phone } }),
   )
 }
+
+/**
+ * The AI diagnostics stored against one message (reference §08).
+ *
+ * **Why this exists at all.** A page of messages embeds `metadata_debug` only
+ * under a 1 MiB budget, and a message past that budget still reports
+ * `has_debug: true` with no payload attached. This is how that one message is
+ * read — on its own, when an operator opens it, never for the whole page.
+ *
+ * **`unknown`, not a guessed interface.** §12 says in as many words that this
+ * endpoint is *not* in `openapi.yaml` and that the reference document is its
+ * only specification — and that document gives the route, not the envelope. A
+ * confident interface here would be a guess wearing a type, so the shape is
+ * decided at the point of use, on the presence of a key, by `debugPayloadOf` in
+ * `@/lib/diagnostics`.
+ *
+ * Unlike `/download` there is no `phone` parameter: §08 addresses this route by
+ * message id alone.
+ *
+ * The route carries `Require(messages.debug.read)` on the server. The UI never
+ * calls it without that permission — not because the refusal would be unsafe,
+ * but because a control that fires a request which can only be refused is a
+ * control that looks broken.
+ */
+export function getMessageDebug(messageId: string) {
+  return results<unknown>(http.get(`/message/${enc(messageId)}/debug`))
+}
