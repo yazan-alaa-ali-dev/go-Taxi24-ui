@@ -1260,6 +1260,7 @@ describe('the operational screens are honest about the account and the channel (
   const CHATS = 'src/pages/chats.tsx'
   const VIEW = 'src/features/chat/message-view.tsx'
   const MEDIA = 'src/features/chat/message-media.tsx'
+  const DIAGNOSTICS = 'src/features/chat/message-diagnostics.tsx'
   const CONTROLS = 'src/features/chat/chat-controls.tsx'
   const CHAT_LIST = 'src/features/chat/chat-list.tsx'
   const PARTICIPANTS = 'src/features/group/participants-panel.tsx'
@@ -1270,8 +1271,13 @@ describe('the operational screens are honest about the account and the channel (
   const CHANNEL = 'src/lib/send-channel.ts'
   const TEXT_FORM = 'src/features/send/text-form.tsx'
 
-  /** Every component that renders one of the two unwindowed lists this phase names. */
-  const LISTS = [VIEW, MEDIA, CONTROLS, CHAT_LIST, PARTICIPANTS]
+  /**
+   * Every component that renders one of the two unwindowed lists this phase
+   * names. `message-diagnostics.tsx` joins them at z8pmx9mv3v: it is
+   * instantiated per message row, inside the component that holds the
+   * composer's `draft`, so the rule is the same rule.
+   */
+  const LISTS = [VIEW, MEDIA, DIAGNOSTICS, CONTROLS, CHAT_LIST, PARTICIPANTS]
 
   function source(path: string): string {
     const found = SOURCES.find(([candidate]) => candidate === path)
@@ -1408,7 +1414,14 @@ describe('the operational screens are honest about the account and the channel (
     // control still announces that the capability exists, which is the thing
     // being spared.
     const chats = source(CHATS)
-    for (const permission of ['MESSAGES_SEND', 'CHATS_WRITE', 'MESSAGES_READ']) {
+    // MESSAGES_DEBUG_READ joins the three (z8pmx9mv3v) rather than becoming a
+    // rule of its own: it is the same rule about the same file.
+    for (const permission of [
+      'MESSAGES_SEND',
+      'CHATS_WRITE',
+      'MESSAGES_READ',
+      'MESSAGES_DEBUG_READ',
+    ]) {
       expect(chats, `chats.tsx reads PERMISSIONS.${permission} once, above the list`).toMatch(
         new RegExp(`PERMISSIONS\\.${permission}`),
       )
@@ -1510,5 +1523,173 @@ describe('the operational screens are honest about the account and the channel (
       dashboard,
       'the header’s create control is hidden too, or AC-23 passes on the empty state and fails on the screen',
     ).toMatch(/belongsToAnAccount\s*\?\s*<CreateDeviceDialog\s*\/>/)
+  })
+})
+
+describe('the diagnostics surface asks before it downloads, and reads keys not values (z8pmx9mv3v)', () => {
+  const CHATS = 'src/pages/chats.tsx'
+  const VIEW = 'src/features/chat/message-view.tsx'
+  const PANEL = 'src/features/chat/message-diagnostics.tsx'
+  const DECISIONS = 'src/lib/diagnostics.ts'
+  const WIRE = 'src/api/chat.ts'
+
+  function sourceOf(path: string): string {
+    const found = SOURCES.find(([candidate]) => candidate === path)
+    expect(found, `${path} should be in the module graph`).toBeTruthy()
+    return found![1]
+  }
+
+  it('RULE: the two maskable debug fields are NAMED in three files and read through them everywhere else', () => {
+    // AC-19, and the shape of the rule matters more than the rule.
+    //
+    // The first draft of this was four regexes for four wrong spellings —
+    // `has_debug === false`, `!message.has_debug`, and so on. Review showed what
+    // this file has now learned three times (the `role` rule's ROLE_CAPS note,
+    // the `password` rule's setPassword note, the `permissions` rule's
+    // destructuring note): a rule that matches a SHAPE is evaded by the next
+    // shape. `!m?.has_debug`, a bracket access, a destructuring rename and a
+    // Yoda comparison all slip past every one of those four patterns while
+    // doing exactly what they ban.
+    //
+    // Containment cannot be evaded by a rename, because the name IS the rule.
+    // The component asks `showsDiagnosticsBadge` and `diagnosticsSource` and
+    // needs neither field name; if a file needs to spell one, it is reading a
+    // maskable field by hand and that is the thing being prevented.
+    expect(
+      offenders(/\bhas_debug\b|\bmetadata_debug\b/, [
+        'src/api/chat.ts', // the wire declaration
+        'src/lib/redaction.ts', // MASKED_FIELDS and hasDiagnostics
+        'src/lib/diagnostics.ts', // the decisions built on them
+      ]),
+      'read it through hasField/hasDiagnostics — or through @/lib/diagnostics, which already has',
+    ).toEqual([])
+  })
+
+  it('RULE: an explicit `false` is never expected of a maskable field', () => {
+    // The cheap second net beside the containment rule above. `has_debug` is
+    // maskable AND omitempty, so `=== false` can never be true and `!== false`
+    // is true for every redacted message in the list — the two mutants most
+    // likely to be written by somebody being careful.
+    expect(
+      offenders(/has_debug\s*[=!]==?\s*false|false\s*[=!]==?\s*[\w.?]*has_debug/),
+      'the only correct test is `=== true`, which lives in hasDiagnostics',
+    ).toEqual([])
+  })
+
+  it('RULE: the wire name `include_debug` exists in exactly one file, and never as false', () => {
+    // AC-6. This is true by construction rather than by allowlist: the UI passes
+    // `includeDebug`, and src/api/chat.ts performs the translation — which is
+    // the whole reason the parameter is built there rather than at the call
+    // site. A rule that needed three exemptions to pass would be an exemption
+    // wearing a rule's name.
+    expect(
+      offenders(/\binclude_debug\b/, [WIRE]),
+      'pass `includeDebug` to getChatMessages; the wire spelling belongs to the API layer',
+    ).toEqual([])
+
+    // `true` or absent — never `false` (§08).
+    expect(
+      offenders(/include_debug\s*[:=]\s*false/),
+      'the off state is an ABSENT parameter, not a false one',
+    ).toEqual([])
+
+    // And the translation itself, which is what makes the containment true.
+    expect(sourceOf(WIRE), 'getChatMessages drops the flag rather than sending false').toMatch(
+      /include_debug:\s*includeDebug\s*\?\s*true\s*:\s*undefined/,
+    )
+  })
+
+  it('RULE: the debug endpoint is reachable from one component, and only with the permission', () => {
+    // AC-3, and the only executable guard a suite with no renderer can put on
+    // it. "No request without messages.debug.read" is otherwise a claim about
+    // JSX that nothing in this repository can mount.
+    expect(
+      offenders(/\bgetMessageDebug\b/, ['src/api/message.ts', PANEL]),
+      'the diagnostics panel is the only caller; a second one is an ungated surface',
+    ).toEqual([])
+
+    // The same line message-media.tsx is held to (`enabled: open && canDownload`):
+    // a hidden control whose request still fires manufactures the refusal the
+    // guard existed to spare the user.
+    expect(sourceOf(PANEL), 'the permission is in the query enabled, not only in the JSX').toMatch(
+      /enabled:\s*canRead\s*&&\s*source\.kind === 'fetch'/,
+    )
+  })
+
+  it('RULE: the panel reads its source once, when it opens', () => {
+    // Recomputing `diagnosticsSource` per render turns ONE opt-in flip into one
+    // request per open panel: turning the embed off replaces every row with a
+    // message carrying no payload key, and every open panel flips from
+    // `embedded` to `fetch` in the same instant. The latch is what keeps "one
+    // message, on open" (AC-14, AC-17) true.
+    expect(sourceOf(PANEL), 'latch the source in a useState initialiser').toMatch(
+      /useState\(\(\)\s*=>\s*diagnosticsSource\(/,
+    )
+  })
+
+  it('RULE: the permission boolean actually reaches the row', () => {
+    // TypeScript catches a MISSING prop; it does not catch a wrong one.
+    // `canRead={mayCompose}` type-checks and fails open, and there is no
+    // renderer here to catch it — so the wiring is asserted textually, the way
+    // this file already asserts other hoisted booleans.
+    expect(sourceOf(CHATS), 'chats.tsx resolves the permission once').toMatch(
+      /useHasPermission\(PERMISSIONS\.MESSAGES_DEBUG_READ\)/,
+    )
+    expect(sourceOf(CHATS), 'and passes that boolean, not another one').toMatch(
+      /mayReadDiagnostics=\{mayReadDiagnostics\}/,
+    )
+    expect(sourceOf(VIEW), 'the row is given the same answer, unchanged').toMatch(
+      /canRead=\{canReadDiagnostics\}/,
+    )
+    expect(sourceOf(VIEW), 'and the request cannot carry the flag without it').toMatch(
+      /includeDebug:\s*mayReadDiagnostics\s*&&\s*includeDebug/,
+    )
+  })
+
+  it('RULE: the opt-in is part of the message cache key, and does not move the pager', () => {
+    // AC-7: without this the embedded and un-embedded answers overwrite each
+    // other under one key, and the operator sees whichever landed last.
+    // AC-23: search and media-only change WHICH messages exist and reset the
+    // offset; this one changes only what each message carries and must not.
+    const view = sourceOf(VIEW)
+    expect(view, 'includeDebug belongs in the query key').toMatch(
+      // `\s*` spans newlines, so this survives prettier wrapping the array.
+      /queryKey:\s*\[\s*'chat-messages',\s*chat\.jid,\s*\{[^}]*includeDebug[^}]*\},?\s*\]/,
+    )
+    expect(
+      /setIncludeDebug\([^)]*\)\s*setOffset\(0\)/.test(view),
+      `${VIEW}: turning the opt-in on must not move the operator to another page`,
+    ).toBe(false)
+  })
+
+  it('RULE: the payload is never parsed, never offered for bulk copy, and never disabled', () => {
+    // AC-15: the payload is a ready object; §11 lists parsing it among the
+    // common traps. AC-27: nothing copies it in bulk. AC-2: absence hides.
+    for (const path of [PANEL, DECISIONS]) {
+      expect(
+        /\bJSON\.parse\b/.test(sourceOf(path)),
+        `${path}: the value is an object already — stringify it, never parse it`,
+      ).toBe(false)
+      expect(
+        /navigator\.clipboard|<a[\s>]|href=|download=/.test(sourceOf(path)),
+        `${path}: the payload is a text child; offering to move it in bulk is a different ticket`,
+      ).toBe(false)
+      expect(
+        /\bdisabled\b/.test(sourceOf(path)),
+        `${path}: absence hides the surface; it is never rendered disabled`,
+      ).toBe(false)
+    }
+  })
+
+  it('RULE: the decisions module takes the permission as an argument and imports no permission module', () => {
+    // AC-21. Whether the surface exists is answered by permissions[]; whether
+    // one payload is embedded is answered by a key. Two authorities, and the
+    // boundary is executable rather than stylistic — the same rule redaction.ts
+    // is held to one describe block above.
+    const decisions = sourceOf(DECISIONS)
+    expect(/from\s+['"][^'"]*permissions['"]/.test(decisions)).toBe(false)
+    expect(decisions, 'the permission arrives as a boolean').toMatch(
+      /showsDiagnosticsBadge\([^)]*canRead: boolean/,
+    )
   })
 })

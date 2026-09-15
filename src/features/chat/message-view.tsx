@@ -1,9 +1,10 @@
-import { memo, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2, Send } from 'lucide-react'
 import { getChatMessages, type ChatInfo, type MessageInfo } from '@/api/chat'
 import { sendText } from '@/api/send'
 import { DeliveryNotice } from '@/components/shared/delivery-notice'
+import { MessageDiagnostics } from '@/features/chat/message-diagnostics'
 import { MessageMedia } from '@/features/chat/message-media'
 import { ChatControls } from '@/features/chat/chat-controls'
 import { Button } from '@/components/ui/button'
@@ -16,6 +17,19 @@ import { sendToast, shouldReadChatHistory } from '@/lib/send-channel'
 import { cn } from '@/lib/utils'
 
 const PAGE_SIZE = 30
+
+/**
+ * How long a keystroke waits before it becomes a request.
+ *
+ * The search box was previously wired straight into the query key, so typing
+ * five characters issued five requests for five pages. That was tolerable while
+ * a page was text only. It stopped being tolerable when the diagnostics opt-in
+ * arrived: an embedded page carries up to a 1 MiB budget of stored payloads, and
+ * one megabyte per keystroke is a different thing entirely. The `Input` below
+ * stays fully controlled and responds immediately; only the value that reaches
+ * the query key is deferred.
+ */
+const SEARCH_DEBOUNCE_MS = 300
 
 function sortMessagesChronologically(messages: MessageInfo[]): MessageInfo[] {
   return [...messages].sort((left, right) => {
@@ -40,15 +54,20 @@ function dayKey(timestamp: string): string {
  *
  * It takes `canDownload` as a prop and calls no hook. A permission hook here
  * would be one store subscription per message for an answer that is identical for
- * all of them (study §13, rule 3).
+ * all of them (study §13, rule 3). `canReadDiagnostics` arrives the same way and
+ * for the same reason — and both stay **bare booleans**: an object or a callback
+ * prop would be a fresh identity on every render and would break this `memo()`
+ * on all thirty rows at once.
  */
 const MessageBubble = memo(function MessageBubble({
   message,
   canDownload,
+  canReadDiagnostics,
   basePath,
 }: {
   message: MessageInfo
   canDownload: boolean
+  canReadDiagnostics: boolean
   basePath: string
 }) {
   const hasMedia = message.media_type && message.media_type !== ''
@@ -70,6 +89,10 @@ const MessageBubble = memo(function MessageBubble({
         {message.reactions && message.reactions.length > 0 && (
           <p className="mt-1 text-xs">{message.reactions.map((r) => r.emoji).join(' ')}</p>
         )}
+        {/* Renders nothing at all without the permission, and nothing at all for
+            a message that carries no diagnostics — the component owns both
+            decisions so that a test can reach them. */}
+        <MessageDiagnostics message={message} canRead={canReadDiagnostics} />
         <p className="text-muted-foreground mt-1 text-right text-[10px]">
           {formatDate(message.timestamp)}
         </p>
@@ -100,31 +123,58 @@ export function MessageView({
   mayCompose,
   mayWriteChats,
   mayDownloadMedia,
+  mayReadDiagnostics,
   basePath,
 }: {
   chat: ChatInfo
   mayCompose: boolean
   mayWriteChats: boolean
   mayDownloadMedia: boolean
+  mayReadDiagnostics: boolean
   basePath: string
 }) {
   const queryClient = useQueryClient()
   const messageList = useRef<HTMLDivElement>(null)
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [mediaOnly, setMediaOnly] = useState(false)
   const [offset, setOffset] = useState(0)
+  const [includeDebug, setIncludeDebug] = useState(false)
   const [draft, setDraft] = useState('')
 
+  // The box stays responsive; the request waits. See SEARCH_DEBOUNCE_MS.
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [search])
+
   const query = useQuery({
-    queryKey: ['chat-messages', chat.jid, { search, mediaOnly, offset }],
+    // `includeDebug` is part of the key, so the embedded and un-embedded answers
+    // are two cache entries rather than one overwriting the other. The key stays
+    // prefixed by `chat.jid`, so the post-send invalidation below still matches.
+    queryKey: [
+      'chat-messages',
+      chat.jid,
+      { search: debouncedSearch, mediaOnly, offset, includeDebug },
+    ],
     queryFn: () =>
       getChatMessages(chat.jid, {
-        search: search || undefined,
+        search: debouncedSearch || undefined,
         media_only: mediaOnly || undefined,
         limit: PAGE_SIZE,
         offset,
+        // The control below is absent without the permission, so this cannot
+        // become true without it — but a principal refreshed under a component
+        // that already toggled it must not leave the flag on. The same
+        // belt-and-braces `message-media.tsx` documents on its own `enabled`.
+        includeDebug: mayReadDiagnostics && includeDebug,
       }),
     placeholderData: keepPreviousData,
+    // An embedded page carries up to a 1 MiB budget of diagnostics and this SPA
+    // never reloads, so those variants are collected a minute after nothing is
+    // watching them rather than sitting for the client default of five. The
+    // text-only page keeps the default.
+    gcTime: includeDebug ? 60_000 : undefined,
   })
 
   const messages = useMemo(
@@ -205,6 +255,25 @@ export function MessageView({
           />
           Media only
         </label>
+        {/* `messages.debug.read`, and absent without it rather than disabled: a
+            greyed-out switch still announces a capability this principal does
+            not have, and the backend ignores the parameter silently — so a
+            control that sent it anyway would look broken rather than refused.
+            Unlike the two above it does NOT reset the offset: search and
+            media-only change WHICH messages exist, this changes only what each
+            one carries. */}
+        {mayReadDiagnostics && (
+          <label className="text-muted-foreground flex items-start gap-2 text-sm">
+            <Switch className="mt-0.5" checked={includeDebug} onCheckedChange={setIncludeDebug} />
+            <span>
+              Embed diagnostics
+              <span className="block text-xs">
+                Ask the server to send each message&apos;s stored AI diagnostics with the page —
+                worth turning on when you are about to inspect several messages.
+              </span>
+            </span>
+          </label>
+        )}
       </div>
 
       <div ref={messageList} className="min-h-0 flex-1">
@@ -243,6 +312,7 @@ export function MessageView({
                     <MessageBubble
                       message={message}
                       canDownload={mayDownloadMedia}
+                      canReadDiagnostics={mayReadDiagnostics}
                       basePath={basePath}
                     />
                   </div>
