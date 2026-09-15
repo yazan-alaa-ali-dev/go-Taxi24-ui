@@ -9,7 +9,7 @@ created_at: 2026-09-15
 updated_at: 2026-09-15
 links:
   clickup: "https://app.clickup.com/t/z8pmx9mv3v"
-  github: ""
+  github: "https://github.com/yazan-alaa-ali-dev/go-Taxi24-ui/pull/14"
 ---
 
 # Ticket: 12 · Show a message's AI diagnostics behind an explicit include_debug opt-in
