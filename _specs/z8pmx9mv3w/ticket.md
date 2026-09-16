@@ -9,7 +9,7 @@ created_at: 2026-09-16
 updated_at: 2026-09-16
 links:
   clickup: "https://app.clickup.com/t/z8pmx9mv3w"
-  github: ""
+  github: "https://github.com/yazan-alaa-ali-dev/go-Taxi24-ui/pull/15"
 ---
 
 # Ticket: 13 · Show a voice note's transcript beneath its existing player
