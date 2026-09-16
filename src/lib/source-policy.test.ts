@@ -1281,7 +1281,22 @@ describe('the operational screens are honest about the account and the channel (
    * path to this list is the whole cost of covering a new per-row component,
    * which is why it is a list rather than a rule repeated per file.
    */
-  const LISTS = [VIEW, MEDIA, DIAGNOSTICS, TRANSCRIPT, CONTROLS, CHAT_LIST, PARTICIPANTS]
+  const DEBUG_DIALOG = 'src/features/chat/agent-debug-dialog.tsx'
+
+  const LISTS = [
+    VIEW,
+    MEDIA,
+    DIAGNOSTICS,
+    TRANSCRIPT,
+    CONTROLS,
+    CHAT_LIST,
+    PARTICIPANTS,
+    // z8pmx9mw2x: the dialog hangs off the chat actions menu, inside the
+    // component that holds the composer's `draft`. Adding a path here is the
+    // whole cost of covering a new component under that subtree — which is why
+    // it is a list rather than a rule repeated per file.
+    DEBUG_DIALOG,
+  ]
 
   function source(path: string): string {
     const found = SOURCES.find(([candidate]) => candidate === path)
@@ -1334,6 +1349,15 @@ describe('the operational screens are honest about the account and the channel (
     // identity is stable and the other props are a boolean and a string — the
     // memo actually holds.
     expect(source(VIEW), 'wrap MessageBubble in React.memo').toMatch(/const MessageBubble = memo\(/)
+    // z8pmx9mw2x: the actions menu is no longer rendered behind `mayWriteChats`
+    // at its call site — it mounts for EVERY principal now and decides its own
+    // absence — so it re-renders on every keystroke too, and re-allocates its
+    // whole menu tree plus the four closures the disappearing list builds. Its
+    // props are the same `selected` object and two bare booleans, so the memo
+    // holds exactly as MessageBubble's does.
+    expect(source(CONTROLS), 'wrap ChatControls in React.memo').toMatch(
+      /export const ChatControls = memo\(/,
+    )
   })
 
   it('RULE: `message_id` and `channel` of a send result are named in two files only', () => {
@@ -1428,6 +1452,9 @@ describe('the operational screens are honest about the account and the channel (
       'MESSAGES_READ',
       'MESSAGES_DEBUG_READ',
       'MESSAGES_TRANSCRIPT_READ',
+      // ADMIN_DEBUG_TOGGLE joins them at z8pmx9mw2x, for the same reason the
+      // two above did: it is the same rule about the same file.
+      'ADMIN_DEBUG_TOGGLE',
     ]) {
       expect(chats, `chats.tsx reads PERMISSIONS.${permission} once, above the list`).toMatch(
         new RegExp(`PERMISSIONS\\.${permission}`),
@@ -1869,6 +1896,209 @@ describe('the transcript reads keys, not values, and adds nothing to the row (z8
     expect(
       /from\s+['"]react['"]|from\s+['"]@\/stores\//.test(decisions),
       `${DECISIONS}: the decisions are pure — the component owns the rendering`,
+    ).toBe(false)
+  })
+})
+
+describe('the debug toggle spends a secret it must never hold (z8pmx9mw2x)', () => {
+  const CHATS = 'src/pages/chats.tsx'
+  const VIEW = 'src/features/chat/message-view.tsx'
+  const CONTROLS = 'src/features/chat/chat-controls.tsx'
+  const DIALOG = 'src/features/chat/agent-debug-dialog.tsx'
+  const DECISIONS = 'src/lib/agent-debug.ts'
+  const WIRE = 'src/api/agent.ts'
+
+  function sourceOf(path: string): string {
+    const found = SOURCES.find(([candidate]) => candidate === path)
+    expect(found, `${path} should be in the module graph`).toBeTruthy()
+    return found![1]
+  }
+
+  it('RULE: no file in src/ names the agent secret, in any casing, ever', () => {
+    // NFR-1 and AC-1, and the one rule in this block that is absolute.
+    //
+    // `POST /agent/debug/toggle` exists at all BECAUSE the browser must not hold
+    // the shared agent key: a browser-side call to the omni API would place it
+    // in the bundle, and that exposure survives the move to HMAC because the
+    // same secret is what signs. GOWA applies the header server-side.
+    //
+    // The exemption list is empty and is expected to stay empty forever — which
+    // is only true because the AGENT_DEBUG_DISABLED sentence in agent-debug.ts
+    // deliberately names no environment variable. An earlier draft of this
+    // ticket put two of those names in that sentence as string literals, and
+    // this rule would have failed on the commit that introduced it: `SOURCES`
+    // strips comments, not strings. Widening the exemption to quiet it would
+    // have removed containment from the exact file that talks about the secret.
+    expect(
+      offenders(/AGENT_WEBHOOK_KEY|X-Agent-Signature|AGENT_DEBUG_TOGGLE_URL/i),
+      'the signing secret is the server’s; nothing in this bundle may name it',
+    ).toEqual([])
+  })
+
+  it('RULE: the toggle path and the ttl wire name exist in exactly one file', () => {
+    // The containment `include_debug` already has one block above, and for the
+    // same reason: `src/api/agent.ts` translates the parsed `TtlField` into the
+    // body, so the wire spelling cannot drift to a call site. A rule stated in
+    // prose decays; a rule the translation makes true does not.
+    expect(offenders(/\/agent\/debug\/toggle/, [WIRE])).toEqual([])
+    expect(
+      offenders(/\bttl_minutes\b/, [WIRE]),
+      'build the body through toggleAgentDebug — it owns the wire spelling',
+    ).toEqual([])
+  })
+
+  it('RULE: the endpoint is reachable from exactly one component', () => {
+    // AC-2. "One operator action, one request, one number" is made a property of
+    // the import graph rather than of a code review: a second caller is a second
+    // place a number could be chosen.
+    expect(
+      offenders(/\btoggleAgentDebug\b/, [WIRE, DIALOG]),
+      'the toggle belongs to the dialog that confirms it',
+    ).toEqual([])
+  })
+
+  it('RULE: the duration reaches the body only through the validator', () => {
+    // A second line of defence, and labelled as one. The GUARANTEE is the type:
+    // `TtlField` has no arm for a bare number, so `+ttl`, `ttl * 1` and `~~ttl`
+    // do not compile — which is what makes this rule worth keeping cheap rather
+    // than worth making clever. A ban on three spellings of a thing the type
+    // system already forbids would be decoration on its own.
+    const dialog = sourceOf(DIALOG)
+    expect(dialog, `${DIALOG}: parse the duration with parseTtl`).toContain('parseTtl(')
+    expect(
+      /\bNumber\s*\(|\bparseInt\s*\(|\bparseFloat\s*\(/.test(dialog),
+      `${DIALOG}: a duration is produced by parseTtl and by nothing else`,
+    ).toBe(false)
+  })
+
+  it('RULE: the permission reaches the menu through both hops TypeScript cannot check', () => {
+    // TypeScript catches a MISSING prop; it does not catch a wrong one.
+    // `mayToggleDebug={mayDownloadMedia}` type-checks and fails OPEN, and there
+    // is no renderer here to catch it.
+    expect(sourceOf(CHATS), 'chats.tsx resolves the permission once').toMatch(
+      /useHasPermission\(PERMISSIONS\.ADMIN_DEBUG_TOGGLE\)/,
+    )
+    expect(sourceOf(CHATS), 'and passes that boolean, not another one').toMatch(
+      /mayToggleDebug=\{mayToggleDebug\}/,
+    )
+    expect(sourceOf(VIEW), 'the view hands the same answer to the menu').toMatch(
+      /mayToggleDebug=\{mayToggleDebug\}/,
+    )
+  })
+
+  it('RULE: the menu’s guard is the decision function, and the dialog is behind it', () => {
+    // AC-6, AC-20, AC-21. Radix renders the menu items through a portal and only
+    // while open, so no server render can reach them — this is the executable
+    // half of "the item is absent for a group, a newsletter, a status broadcast
+    // and a @lid", with `debugToggleTarget` unit-tested for the other half.
+    const controls = sourceOf(CONTROLS)
+    expect(controls, `${CONTROLS}: ask debugToggleTarget, never the jid directly`).toMatch(
+      /debugToggleTarget\(chat\.jid, mayToggleDebug\)/,
+    )
+    expect(controls, `${CONTROLS}: the dialog mounts only behind a derived number`).toMatch(
+      /\{debugPhone && intent && \(?\s*<AgentDebugDialog/,
+    )
+    // And the menu owns its own absence, which is what lets a renderless test
+    // assert anything at all about it.
+    expect(controls).toMatch(/if \(!mayWriteChats && !debugPhone\) return null/)
+  })
+
+  it('RULE: the toggle surface opens no observer, no subscription and no poll', () => {
+    // AC-26, AC-30, AC-45. A toggle changes nothing about the conversation, its
+    // messages or the chat list, so no cache is invalidated; and nothing here
+    // may re-send a refused call by itself — every retry in this feature is a
+    // button an operator presses.
+    const dialog = sourceOf(DIALOG)
+    for (const banned of [
+      /\buseQuery\(/,
+      /\brefetchInterval\b/,
+      /\brefetchOnWindowFocus\b/,
+      /\bsetInterval\b/,
+      /\binvalidateQueries\b/,
+      /\buseQueryClient\(/,
+    ]) {
+      expect(
+        banned.test(dialog),
+        `${DIALOG}: ${banned.source} has no place in a fire-and-report action`,
+      ).toBe(false)
+    }
+    expect(dialog, `${DIALOG}: TanStack must not re-send a refused toggle`).toMatch(
+      /retry: false/,
+    )
+    // The one timer this feature owns: it forgets a reported expiry, and it is
+    // cleaned up. Its delay is decided by the pure `expiryDelay`, not here.
+    expect(dialog).toContain('expiryDelay(')
+    expect(dialog, `${DIALOG}: a timer without a cleanup is a timer that races`).toContain(
+      'clearTimeout(',
+    )
+  })
+
+  it('RULE: one operator decision is one request, and a 200 is the only way to a confirmation', () => {
+    // AC-13 and AC-48, both of which would otherwise live only in JSX where no
+    // test in this repository can reach them.
+    const dialog = sourceOf(DIALOG)
+    expect(
+      dialog,
+      `${DIALOG}: every control that can send is disabled while one is in flight`,
+    ).toMatch(/disabled=\{toggle\.isPending\}/)
+    expect(
+      dialog,
+      `${DIALOG}: and the dialog cannot be dismissed out from under a request`,
+    ).toMatch(/!toggle\.isPending/)
+    // `isSuccess`, never `!isError`: the latter is also true before anything has
+    // been sent, so it would confirm a toggle that never happened.
+    expect(dialog, `${DIALOG}: the confirmation is reachable only from a success`).toContain(
+      'toggle.isSuccess',
+    )
+    expect(
+      /!\s*toggle\.isError/.test(dialog),
+      `${DIALOG}: "not failed" is true before anything was sent`,
+    ).toBe(false)
+  })
+
+  it('RULE: the conversation subtree is keyed on the selected chat', () => {
+    // The dialog latches its target on mount, so the number on screen is the
+    // number sent. That latch is only safe while switching conversations
+    // remounts the subtree — an invariant worth depending on is an invariant
+    // worth pinning, rather than one a later refactor discovers by breaking it.
+    expect(sourceOf(CHATS), 'MessageView is keyed on the selected chat').toMatch(
+      /key=\{selected\.jid\}/,
+    )
+    expect(sourceOf(DIALOG), 'and the dialog reads its target once').toMatch(
+      /useState\(\(\) => phone\)/,
+    )
+  })
+
+  it('RULE: the echoed number is matched, never merely sanitised', () => {
+    // AC-50. The proxy returns the upstream body UNMODIFIED, so `results.phone`
+    // is a string this application does not control, rendered into the one
+    // sentence naming which customer's number was changed. Capping and stripping
+    // it would still put an attacker-chosen value inside that claim; matching it
+    // against the shape a phone number has does not.
+    const decisions = sourceOf(DECISIONS)
+    expect(decisions, `${DECISIONS}: allow-list the echoed phone`).toMatch(
+      /E164\.test\(body\.phone\)/,
+    )
+    expect(
+      decisions,
+      `${DECISIONS}: and the server’s own prose is stripped as well as capped`,
+    ).toContain('displayText(error.message, MAX_SERVER_MESSAGE)')
+  })
+
+  it('RULE: the decisions module takes the permission as an argument and imports no permission module', () => {
+    // The boundary rule tickets 12 and 13 both carry. Whether the surface exists
+    // is answered by permissions[]; whether this conversation has a number is
+    // answered by its jid. Two authorities, and the separation is executable.
+    const decisions = sourceOf(DECISIONS)
+    expect(/from\s+['"][^'"]*permissions['"]/.test(decisions)).toBe(false)
+    expect(decisions, 'the permission arrives as a boolean').toMatch(
+      /debugToggleTarget\([^)]*canToggle: boolean/,
+    )
+    // And the module stays pure: no React, no store, no axios. This app has no
+    // error boundary anywhere, so a throw on a rendering path blanks the SPA.
+    expect(
+      /from\s+['"]react['"]|from\s+['"]@\/stores\/|from\s+['"]axios['"]/.test(decisions),
+      `${DECISIONS}: the decisions are pure — the dialog owns the rendering`,
     ).toBe(false)
   })
 })
