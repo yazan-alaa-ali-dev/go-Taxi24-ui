@@ -9,7 +9,7 @@ created_at: 2026-09-16
 updated_at: 2026-09-16
 links:
   clickup: "https://app.clickup.com/t/z8pmx9mw2x"
-  github: ""
+  github: "https://github.com/yazan-alaa-ali-dev/go-Taxi24-ui/pull/16"
 ---
 
 # Ticket: 14 · Toggle the AI agent's debug collection for one number
