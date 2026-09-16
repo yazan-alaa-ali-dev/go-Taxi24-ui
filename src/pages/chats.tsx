@@ -18,7 +18,7 @@ import type { ChatInfo } from '@/api/chat'
  * the message rows, so anything placed in that subtree re-runs on **every
  * keystroke**, and `MessageMedia` is instantiated per row. A `useHasPermission`
  * there would be one store subscription re-evaluated per character, or one per
- * message; here it is four subscriptions for the life of the page, and the
+ * message; here it is five subscriptions for the life of the page, and the
  * answers travel down as booleans (`src/components/shared/can.tsx` documents this
  * rule and names this exact file as the reason it exists).
  *
@@ -27,7 +27,7 @@ import type { ChatInfo } from '@/api/chat'
  * is a query observer and a store subscription per row for one shared,
  * `staleTime: Infinity` answer.
  *
- * All five sit **above** the `if (!device)` return — they are hooks, and a
+ * All six sit **above** the `if (!device)` return — they are hooks, and a
  * conditional call is a rules-of-hooks violation rather than an optimisation.
  *
  * Hiding a control is an affordance, never enforcement: the server guards every
@@ -47,6 +47,11 @@ export default function ChatsPage() {
   // above: a hook inside the message view is re-evaluated on every keystroke in
   // the composer, and one inside a row is a subscription per message.
   const mayReadDiagnostics = useHasPermission(PERMISSIONS.MESSAGES_DEBUG_READ)
+  // The transcript beneath a voice note's player. A separate permission from
+  // `messages.read` above, and deliberately so: losing this costs the text and
+  // nothing else — the recording still plays and still downloads. Read here for
+  // the same reason as the four around it.
+  const mayReadTranscripts = useHasPermission(PERMISSIONS.MESSAGES_TRANSCRIPT_READ)
   const { data: appInfo } = useAppInfo()
   const [selected, setSelected] = useState<ChatInfo | null>(null)
   const messagePane = useRef<HTMLDivElement>(null)
@@ -85,6 +90,7 @@ export default function ChatsPage() {
               mayWriteChats={mayWriteChats}
               mayDownloadMedia={mayDownloadMedia}
               mayReadDiagnostics={mayReadDiagnostics}
+              mayReadTranscripts={mayReadTranscripts}
               basePath={appInfo?.base_path ?? ''}
             />
           ) : (

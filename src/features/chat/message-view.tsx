@@ -6,6 +6,7 @@ import { sendText } from '@/api/send'
 import { DeliveryNotice } from '@/components/shared/delivery-notice'
 import { MessageDiagnostics } from '@/features/chat/message-diagnostics'
 import { MessageMedia } from '@/features/chat/message-media'
+import { MessageTranscript } from '@/features/chat/message-transcript'
 import { ChatControls } from '@/features/chat/chat-controls'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -54,20 +55,24 @@ function dayKey(timestamp: string): string {
  *
  * It takes `canDownload` as a prop and calls no hook. A permission hook here
  * would be one store subscription per message for an answer that is identical for
- * all of them (study §13, rule 3). `canReadDiagnostics` arrives the same way and
- * for the same reason — and both stay **bare booleans**: an object or a callback
- * prop would be a fresh identity on every render and would break this `memo()`
- * on all thirty rows at once.
+ * all of them (study §13, rule 3). `canReadDiagnostics` and
+ * `canReadTranscript` arrive the same way and for the same reason — and all
+ * three stay **bare booleans**: an object or a callback prop would be a fresh
+ * identity on every render and would break this `memo()` on all thirty rows at
+ * once. That is also why `message-transcript.tsx` computes its view object
+ * *inside* itself rather than taking one as a prop.
  */
 const MessageBubble = memo(function MessageBubble({
   message,
   canDownload,
   canReadDiagnostics,
+  canReadTranscript,
   basePath,
 }: {
   message: MessageInfo
   canDownload: boolean
   canReadDiagnostics: boolean
+  canReadTranscript: boolean
   basePath: string
 }) {
   const hasMedia = message.media_type && message.media_type !== ''
@@ -86,6 +91,13 @@ const MessageBubble = memo(function MessageBubble({
         {hasMedia && (
           <MessageMedia message={message} canDownload={canDownload} basePath={basePath} />
         )}
+        {/* Beneath the player, never instead of it (reference §11): the audio
+            above is untouched and stays downloadable. It is deliberately NOT
+            gated on `hasMedia` — the transcript is a field of a row this
+            principal already holds, and gating it on a second field would invent
+            a coupling the payload does not have. A message carrying no
+            transcript keys renders nothing here, so a text row is unchanged. */}
+        <MessageTranscript message={message} canRead={canReadTranscript} />
         {message.reactions && message.reactions.length > 0 && (
           <p className="mt-1 text-xs">{message.reactions.map((r) => r.emoji).join(' ')}</p>
         )}
@@ -106,7 +118,7 @@ const MessageBubble = memo(function MessageBubble({
  *
  * **Every permission arrives as a prop and none is read here.** `draft` lives in
  * this component alongside the message list, so a hook here re-runs on every
- * keystroke; `src/pages/chats.tsx` reads all four values once, above. `basePath`
+ * keystroke; `src/pages/chats.tsx` reads all five values once, above. `basePath`
  * is here for the same reason — `message-media.tsx` used to call `useAppInfo()`
  * once per media-bearing row.
  *
@@ -124,6 +136,7 @@ export function MessageView({
   mayWriteChats,
   mayDownloadMedia,
   mayReadDiagnostics,
+  mayReadTranscripts,
   basePath,
 }: {
   chat: ChatInfo
@@ -131,6 +144,7 @@ export function MessageView({
   mayWriteChats: boolean
   mayDownloadMedia: boolean
   mayReadDiagnostics: boolean
+  mayReadTranscripts: boolean
   basePath: string
 }) {
   const queryClient = useQueryClient()
@@ -313,6 +327,7 @@ export function MessageView({
                       message={message}
                       canDownload={mayDownloadMedia}
                       canReadDiagnostics={mayReadDiagnostics}
+                      canReadTranscript={mayReadTranscripts}
                       basePath={basePath}
                     />
                   </div>
