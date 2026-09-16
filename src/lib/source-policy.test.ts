@@ -1261,6 +1261,7 @@ describe('the operational screens are honest about the account and the channel (
   const VIEW = 'src/features/chat/message-view.tsx'
   const MEDIA = 'src/features/chat/message-media.tsx'
   const DIAGNOSTICS = 'src/features/chat/message-diagnostics.tsx'
+  const TRANSCRIPT = 'src/features/chat/message-transcript.tsx'
   const CONTROLS = 'src/features/chat/chat-controls.tsx'
   const CHAT_LIST = 'src/features/chat/chat-list.tsx'
   const PARTICIPANTS = 'src/features/group/participants-panel.tsx'
@@ -1275,9 +1276,12 @@ describe('the operational screens are honest about the account and the channel (
    * Every component that renders one of the two unwindowed lists this phase
    * names. `message-diagnostics.tsx` joins them at z8pmx9mv3v: it is
    * instantiated per message row, inside the component that holds the
-   * composer's `draft`, so the rule is the same rule.
+   * composer's `draft`, so the rule is the same rule. `message-transcript.tsx`
+   * joins them at z8pmx9mv3w, for the third time and the same reason: adding a
+   * path to this list is the whole cost of covering a new per-row component,
+   * which is why it is a list rather than a rule repeated per file.
    */
-  const LISTS = [VIEW, MEDIA, DIAGNOSTICS, CONTROLS, CHAT_LIST, PARTICIPANTS]
+  const LISTS = [VIEW, MEDIA, DIAGNOSTICS, TRANSCRIPT, CONTROLS, CHAT_LIST, PARTICIPANTS]
 
   function source(path: string): string {
     const found = SOURCES.find(([candidate]) => candidate === path)
@@ -1416,11 +1420,14 @@ describe('the operational screens are honest about the account and the channel (
     const chats = source(CHATS)
     // MESSAGES_DEBUG_READ joins the three (z8pmx9mv3v) rather than becoming a
     // rule of its own: it is the same rule about the same file.
+    // MESSAGES_TRANSCRIPT_READ joins them at z8pmx9mv3w, for the same reason
+    // MESSAGES_DEBUG_READ did: it is the same rule about the same file.
     for (const permission of [
       'MESSAGES_SEND',
       'CHATS_WRITE',
       'MESSAGES_READ',
       'MESSAGES_DEBUG_READ',
+      'MESSAGES_TRANSCRIPT_READ',
     ]) {
       expect(chats, `chats.tsx reads PERMISSIONS.${permission} once, above the list`).toMatch(
         new RegExp(`PERMISSIONS\\.${permission}`),
@@ -1691,5 +1698,177 @@ describe('the diagnostics surface asks before it downloads, and reads keys not v
     expect(decisions, 'the permission arrives as a boolean').toMatch(
       /showsDiagnosticsBadge\([^)]*canRead: boolean/,
     )
+  })
+})
+
+describe('the transcript reads keys, not values, and adds nothing to the row (z8pmx9mv3w)', () => {
+  const CHATS = 'src/pages/chats.tsx'
+  const VIEW = 'src/features/chat/message-view.tsx'
+  const SURFACE = 'src/features/chat/message-transcript.tsx'
+  const DECISIONS = 'src/lib/transcript.ts'
+  const WIRE = 'src/api/chat.ts'
+  const REDACTION = 'src/lib/redaction.ts'
+
+  function sourceOf(path: string): string {
+    const found = SOURCES.find(([candidate]) => candidate === path)
+    expect(found, `${path} should be in the module graph`).toBeTruthy()
+    return found![1]
+  }
+
+  /**
+   * The three maskable transcript fields, matched as **identifiers** rather than
+   * as a bare word.
+   *
+   * Two exclusions, and both are load-bearing rather than cosmetic — the rule
+   * failed on its own introducing commit without them, which is what the review
+   * panel caught:
+   *
+   * - **`(?<![-/])`** drops module specifiers. `SOURCES` strips comments but not
+   *   import paths, and this feature's name *is* its field name, so
+   *   `from './message-transcript'` and `from '@/lib/transcript'` both match a
+   *   plain `\btranscript\b`. This never arose for `has_debug`/`metadata_debug`
+   *   one block above, because those names appear in no path.
+   * - **`(?!\.read)`** drops the permission id. `permissions.ts` contains the
+   *   string `'messages.transcript.read'`, which is a *permission*, not a field
+   *   read — a different namespace entirely.
+   *
+   * Excluding those two contexts is what lets `permissions.ts` pass with **no
+   * exemption** and, more importantly, lets `message-transcript.tsx` stay
+   * guarded: it is the file where hand-reading a maskable field would be most
+   * tempting, and allowlisting it to quiet the rule would have removed
+   * containment from exactly the wrong place.
+   *
+   * It still catches every shape that matters — `message.transcript`,
+   * `m?.transcript`, `message['transcript_status']`, `const { transcript } =`,
+   * and a destructuring rename — because containment cannot be evaded by a
+   * rename: the name IS the rule. `transcriptView`/`transcriptNote` do not match
+   * (no word boundary after `transcript`), which is the point: a file that needs
+   * the decisions asks for them by function.
+   */
+  const TRANSCRIPT_FIELD = /(?<![-/])\btranscript(_language|_status)?\b(?!\.read)/
+
+  it('RULE: the three maskable transcript fields are NAMED in three files and read through them everywhere else', () => {
+    // AC-23. The same containment shape the diagnostics block above uses, and
+    // for the reason this file has now recorded five times: a rule that matches
+    // a SHAPE is evaded by the next shape, so the rule matches the NAME.
+    //
+    // No test file appears in the allowlist because `SOURCES` already filters
+    // `*.test.ts` and `*.test.tsx` out — an allowlist entry that could never
+    // match would read as an exemption that is not one.
+    expect(
+      offenders(TRANSCRIPT_FIELD, [
+        WIRE, // the wire declaration
+        REDACTION, // MASKED_FIELDS
+        DECISIONS, // the decisions built on them
+      ]),
+      'read it through hasField — or through @/lib/transcript, which already has',
+    ).toEqual([])
+  })
+
+  it('RULE: the containment regex excludes module paths and the permission id, and nothing else', () => {
+    // The rule above is only worth as much as this regex, and the regex has two
+    // exclusions that could each hide a real read if they were written too
+    // wide. So the exclusions are themselves asserted, against the exact strings
+    // that appear in this repository.
+    expect(TRANSCRIPT_FIELD.test("from '@/features/chat/message-transcript'")).toBe(false)
+    expect(TRANSCRIPT_FIELD.test("from '@/lib/transcript'")).toBe(false)
+    expect(TRANSCRIPT_FIELD.test("MESSAGES_TRANSCRIPT_READ: 'messages.transcript.read'")).toBe(
+      false,
+    )
+    // …and still catches the reads it exists for.
+    expect(TRANSCRIPT_FIELD.test('const text = message.transcript')).toBe(true)
+    expect(TRANSCRIPT_FIELD.test('const { transcript } = message')).toBe(true)
+    expect(TRANSCRIPT_FIELD.test("message['transcript_status']")).toBe(true)
+    expect(TRANSCRIPT_FIELD.test('m?.transcript_language')).toBe(true)
+  })
+
+  it('RULE: the permission reaches the row through all three hops', () => {
+    // TypeScript catches a MISSING prop; it does not catch a wrong one.
+    // `canReadTranscript={mayDownloadMedia}` type-checks and fails OPEN, and
+    // there is no renderer here to catch it — so all three hops are asserted
+    // textually. The middle hop is the one an earlier draft of this ticket left
+    // unpinned, and it is the one that is easiest to mis-wire.
+    expect(sourceOf(CHATS), 'chats.tsx resolves the permission once').toMatch(
+      /useHasPermission\(PERMISSIONS\.MESSAGES_TRANSCRIPT_READ\)/,
+    )
+    expect(sourceOf(CHATS), 'and passes that boolean, not another one').toMatch(
+      /mayReadTranscripts=\{mayReadTranscripts\}/,
+    )
+    expect(sourceOf(VIEW), 'the view hands the same answer to the row').toMatch(
+      /canReadTranscript=\{mayReadTranscripts\}/,
+    )
+    expect(sourceOf(VIEW), 'and the row hands it to the surface, unchanged').toMatch(
+      /canRead=\{canReadTranscript\}/,
+    )
+  })
+
+  it('RULE: the transcript surface opens no observer, no subscription and no timer', () => {
+    // AC-30 and NFR-2. The transcript rides on the message the conversation page
+    // already returned, so this surface must add nothing to the page's network
+    // profile — and a `pending` transcript is a fact about the server, not work
+    // happening in this browser, so nothing polls for it.
+    //
+    // The hook ban is deliberate rather than incidental: a `useMemo` here would
+    // be a guaranteed cache MISS, because the only thing that re-renders this
+    // component is a new `message` identity — which is what the memo would key
+    // on. The lever is bounding the input, which `MAX_TRANSCRIPT_RAW` does.
+    const surface = sourceOf(SURFACE)
+    expect(
+      /\buse[A-Z]\w*\(/.test(surface),
+      `${SURFACE}: the surface takes props; it calls no hook at all`,
+    ).toBe(false)
+    expect(
+      /\brefetchInterval\b|\bsetInterval\b|\bsetTimeout\b/.test(surface),
+      `${SURFACE}: nothing polls a pending transcript — the UI has no endpoint to poll`,
+    ).toBe(false)
+    expect(
+      /\bdisabled\b|<Button[\s/>]|onClick=/.test(surface),
+      `${SURFACE}: absence hides the surface, and there is no endpoint to retry with`,
+    ).toBe(false)
+  })
+
+  it('RULE: each of the three fields is reached through hasField, by name', () => {
+    // The one rule in this block that exists *because* of the mutation pass.
+    //
+    // Replacing `hasField(message, 'transcript')` with `!message.transcript` is
+    // an **equivalent mutant**: the field is typed `string`, the only falsy
+    // string is `''`, and both spellings already render `''` as nothing — so no
+    // behavioural test can tell them apart, and writing one would mean inventing
+    // a requirement the spec does not have. The same is true of
+    // `transcript_language`. (It is NOT true of `transcript_status`, where an
+    // empty value is a present-but-unrecognised key and a truthiness test
+    // silently falls through to the no-status branch — that mutant is killed by
+    // a test in `transcript.test.ts`.)
+    //
+    // Equivalent today is not equivalent tomorrow: the moment the wire type
+    // widens, or a fourth field arrives, the truthiness spelling starts turning
+    // an absent key into a value. So the discipline is asserted on the source
+    // instead of on the behaviour — which is exactly what this file is for.
+    const decisions = sourceOf(DECISIONS)
+    for (const field of ['transcript', 'transcript_language', 'transcript_status']) {
+      expect(
+        decisions,
+        `${DECISIONS}: read '${field}' through hasField — a truthiness test turns an absent key into a value`,
+      ).toContain(`hasField(message, '${field}')`)
+    }
+  })
+
+  it('RULE: the decisions module takes the permission as an argument and imports no permission module', () => {
+    // AC-25. Whether the surface exists is answered by permissions[]; whether
+    // one message carries a transcript is answered by a key. Two authorities,
+    // and the boundary is executable rather than stylistic — the same rule
+    // redaction.ts and diagnostics.ts are both held to.
+    const decisions = sourceOf(DECISIONS)
+    expect(/from\s+['"][^'"]*permissions['"]/.test(decisions)).toBe(false)
+    expect(decisions, 'the permission arrives as a boolean').toMatch(
+      /transcriptView\([^)]*canRead: boolean/,
+    )
+    // And the module stays pure: no React, no store, no axios. It runs for every
+    // row of every conversation and this app has no error boundary anywhere, so
+    // a throw on this path blanks the SPA rather than one bubble.
+    expect(
+      /from\s+['"]react['"]|from\s+['"]@\/stores\//.test(decisions),
+      `${DECISIONS}: the decisions are pure — the component owns the rendering`,
+    ).toBe(false)
   })
 })
