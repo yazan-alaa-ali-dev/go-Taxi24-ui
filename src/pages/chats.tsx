@@ -27,7 +27,7 @@ import type { ChatInfo } from '@/api/chat'
  * is a query observer and a store subscription per row for one shared,
  * `staleTime: Infinity` answer.
  *
- * All six sit **above** the `if (!device)` return — they are hooks, and a
+ * All seven sit **above** the `if (!device)` return — they are hooks, and a
  * conditional call is a rules-of-hooks violation rather than an optimisation.
  *
  * Hiding a control is an affordance, never enforcement: the server guards every
@@ -52,6 +52,13 @@ export default function ChatsPage() {
   // nothing else — the recording still plays and still downloads. Read here for
   // the same reason as the four around it.
   const mayReadTranscripts = useHasPermission(PERMISSIONS.MESSAGES_TRANSCRIPT_READ)
+  // The AI-diagnostics collection switch in the chat actions menu. A **write**
+  // permission, and deliberately independent of `messages.debug.read` above:
+  // deciding for which number the agent collects diagnostics is a different
+  // authority from reading the ones it already collected, and a principal may
+  // hold either without the other. Read here for the same reason as the five
+  // around it — the menu lives inside the message view.
+  const mayToggleDebug = useHasPermission(PERMISSIONS.ADMIN_DEBUG_TOGGLE)
   const { data: appInfo } = useAppInfo()
   const [selected, setSelected] = useState<ChatInfo | null>(null)
   const messagePane = useRef<HTMLDivElement>(null)
@@ -91,6 +98,7 @@ export default function ChatsPage() {
               mayDownloadMedia={mayDownloadMedia}
               mayReadDiagnostics={mayReadDiagnostics}
               mayReadTranscripts={mayReadTranscripts}
+              mayToggleDebug={mayToggleDebug}
               basePath={appInfo?.base_path ?? ''}
             />
           ) : (

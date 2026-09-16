@@ -118,7 +118,7 @@ const MessageBubble = memo(function MessageBubble({
  *
  * **Every permission arrives as a prop and none is read here.** `draft` lives in
  * this component alongside the message list, so a hook here re-runs on every
- * keystroke; `src/pages/chats.tsx` reads all five values once, above. `basePath`
+ * keystroke; `src/pages/chats.tsx` reads all six values once, above. `basePath`
  * is here for the same reason — `message-media.tsx` used to call `useAppInfo()`
  * once per media-bearing row.
  *
@@ -137,6 +137,7 @@ export function MessageView({
   mayDownloadMedia,
   mayReadDiagnostics,
   mayReadTranscripts,
+  mayToggleDebug,
   basePath,
 }: {
   chat: ChatInfo
@@ -145,6 +146,7 @@ export function MessageView({
   mayDownloadMedia: boolean
   mayReadDiagnostics: boolean
   mayReadTranscripts: boolean
+  mayToggleDebug: boolean
   basePath: string
 }) {
   const queryClient = useQueryClient()
@@ -243,10 +245,20 @@ export function MessageView({
           <h2 className="truncate font-medium">{chat.name || chat.jid}</h2>
           <p className="text-muted-foreground truncate font-mono text-xs">{chat.jid}</p>
         </div>
-        {/* Pin, archive and disappearing are all `chats.write`. Absent, never
-            disabled: a disabled menu still announces that the capability
-            exists. */}
-        {mayWriteChats && <ChatControls chat={chat} />}
+        {/* **The menu decides its own absence, and this call site no longer
+            does.** It used to be gated on `chats.write` alone, which was correct
+            while pin/archive/disappearing were the only things in it. Since
+            z8pmx9mw2x it also carries the AI-diagnostics collection switch behind
+            `admin.debug.toggle` — an independent permission — so gating the whole
+            menu on either one would hide the other from a principal entitled to
+            it. `ChatControls` returns `null` when it has nothing to offer, which
+            keeps "absent, never disabled" true and is the only shape a test suite
+            with no renderer can assert. */}
+        <ChatControls
+          chat={chat}
+          mayWriteChats={mayWriteChats}
+          mayToggleDebug={mayToggleDebug}
+        />
       </div>
 
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
