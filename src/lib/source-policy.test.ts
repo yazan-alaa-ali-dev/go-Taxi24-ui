@@ -916,6 +916,17 @@ describe('the account devices surface joins on the rows and pays no per-row cost
       /toast[^\n]*\bsecret\b|`[^`]*\$\{secret\}/.test(dialog),
       'the secret appears in no message this app writes',
     ).toBe(false)
+    // z8pmx9p135: the secret now also travels under the name `secretToSend`
+    // (replacement, else stored), and it is validated — so the validators are a
+    // new place a message could quote it.
+    expect(
+      /value=\{secretToSend\}|toast[^\n]*\bsecretToSend\b|`[^`]*\$\{secretToSend\}/.test(dialog),
+      'the secret to be sent is neither bound to an input nor written into a message',
+    ).toBe(false)
+    expect(
+      /`[^`]*\$\{(secret|secretToSend)\}/.test(sourceOf('src/lib/device-webhook.ts')),
+      'no validator or warning interpolates the secret it was given',
+    ).toBe(false)
     expect(dialog, 'a failed save is classified before anything is rendered').toMatch(
       /webhookSaveFailure\(error\)/,
     )
