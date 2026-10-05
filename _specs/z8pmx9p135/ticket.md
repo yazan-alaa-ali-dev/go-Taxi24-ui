@@ -9,7 +9,7 @@ created_at: 2026-10-05
 updated_at: 2026-10-05
 links:
   clickup: "https://app.clickup.com/t/z8pmx9p135"
-  github: ""
+  github: "https://github.com/yazan-alaa-ali-dev/go-Taxi24-ui/pull/17"
 ---
 
 # Ticket: Device webhook — authentication mode, custom header, effective values and events picker
