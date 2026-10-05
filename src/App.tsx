@@ -6,6 +6,7 @@ import { SURFACE_PERMISSIONS } from '@/components/layout/navigation'
 import { RequirePermission } from '@/components/layout/require-permission'
 import { RequireSession } from '@/components/layout/require-session'
 import { onWsEvent } from '@/lib/events'
+import { deviceWebhookKey } from '@/lib/query-keys'
 import { sessionRefresh } from '@/lib/session-refresh'
 import { LOGIN_PATH } from '@/lib/session-route'
 import { wsClient } from '@/lib/ws'
@@ -110,6 +111,21 @@ function useBootstrap() {
             const removed = (event.result as { device_id?: string } | null)?.device_id
             const { selectedDeviceId, selectDevice } = useDeviceStore.getState()
             if (removed && removed === selectedDeviceId) selectDevice(null)
+            break
+          }
+          case 'DEVICE_WEBHOOK_CONFIG_UPDATED': {
+            // Only the id is read, and the event only invalidates: the
+            // configuration — secret included — comes from the authorised GET,
+            // never from a broadcast payload. `cancelRefetch: false` joins the
+            // dialog's own refetch after its save or toggle instead of aborting
+            // it for an identical request.
+            const updated = (event.result as { device_id?: unknown } | null)?.device_id
+            if (typeof updated === 'string' && updated !== '') {
+              void queryClient.invalidateQueries(
+                { queryKey: deviceWebhookKey(updated) },
+                { cancelRefetch: false },
+              )
+            }
             break
           }
           default:

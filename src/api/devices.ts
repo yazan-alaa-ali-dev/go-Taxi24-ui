@@ -1,12 +1,24 @@
 import type { DeviceStatus, LoginQr, PairCode, RegistryDevice } from '@/api/types'
 import { http, results } from '@/lib/http'
 
+/**
+ * How a device's webhook authenticates to its receiver.
+ *
+ * `true` sends `sha256=` + an HMAC-SHA256 of the raw body; `false` sends the
+ * secret itself, verbatim; `null` inherits the deployment default. Three
+ * states, not two: `null` is not `false`, and reading one as the other turns an
+ * inherited signature into a plaintext credential.
+ */
+export type WebhookSign = boolean | null
+
 export interface AddDevicePayload {
   device_id?: string
   webhook_url?: string
   webhook_secret?: string
   webhook_events?: string
   webhook_insecure_skip_verify?: boolean
+  webhook_header_name?: string | null
+  webhook_sign?: WebhookSign
 }
 
 const enc = encodeURIComponent
@@ -76,6 +88,13 @@ export interface DeviceWebhookSettings {
   webhook_secret: string
   webhook_events: string
   webhook_insecure_skip_verify: boolean
+  /**
+   * The header carrying the credential. `""` or `null` inherits the deployment
+   * default. Optional because a deployment predating the field omits it.
+   */
+  webhook_header_name?: string | null
+  /** See `WebhookSign`. Absent on a deployment predating the field. */
+  webhook_sign?: WebhookSign
 }
 
 /**
@@ -94,6 +113,13 @@ export interface DeviceWebhookSettings {
  */
 export interface DeviceWebhookConfig extends DeviceWebhookSettings {
   webhook_enabled?: boolean
+  /**
+   * What the server will actually send once inheritance is resolved — the
+   * operator cannot read the deployment's environment, so this is the only
+   * place they learn it. `GET` only; the `PATCH` response does not carry it.
+   */
+  effective_webhook_header_name?: string
+  effective_webhook_sign?: boolean
 }
 
 export interface UpdateDeviceWebhookPayload {
@@ -108,6 +134,13 @@ export interface UpdateDeviceWebhookPayload {
   webhook_secret?: string
   webhook_events?: string
   webhook_insecure_skip_verify?: boolean
+  /**
+   * **Absent-preserving, unlike the four fields above**: omitting it keeps the
+   * stored value, and only an explicit `null` (or `""`) resets it to inherit.
+   */
+  webhook_header_name?: string | null
+  /** Absent-preserving, like the header name. `null` resets to inherit. */
+  webhook_sign?: WebhookSign
 }
 
 export async function getDeviceWebhook(deviceId: string): Promise<DeviceWebhookConfig> {
