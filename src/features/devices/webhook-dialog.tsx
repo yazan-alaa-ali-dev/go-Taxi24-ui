@@ -27,11 +27,16 @@ import {
   authModeFrom,
   effectiveAuthFrom,
   effectiveSchemeFrom,
+  exposedSecretWarning,
   inheritedPlainWarning,
   inheritedV1Notice,
   modeAfterSchemeChange,
   parseWebhookEvents,
   plainWarning,
+  rejectionPointer,
+  rejectionShownAt,
+  schemeSwitchConfirmation,
+  schemeSwitchFrom,
   serializeWebhookEvents,
   v1InForce,
   webhookEnabledFrom,
@@ -40,18 +45,25 @@ import {
   webhookFormEdited,
   webhookFormErrors,
   webhookPayloadFrom,
+  webhookRejectionFrom,
   webhookSaveEffect,
   webhookSaveFailure,
   webhookUrlNotice,
   type WebhookAuthMode,
+  type WebhookField,
   type WebhookFields,
+  type WebhookRejection,
   type WebhookScheme,
   type WebhookSchemeState,
 } from '@/lib/device-webhook'
 import { toActionErrorMessage } from '@/lib/auth-messages'
 import { PERMISSIONS } from '@/lib/permissions'
 import { deviceWebhookKey } from '@/lib/query-keys'
-import { SchemeInvalidWarning, WebhookAuthentication } from './webhook-authentication'
+import {
+  SchemeInvalidWarning,
+  SchemeSwitchConfirmation,
+  WebhookAuthentication,
+} from './webhook-authentication'
 
 /**
  * One device's webhook: where its events go, whether they go at all, and how
@@ -88,6 +100,12 @@ import { SchemeInvalidWarning, WebhookAuthentication } from './webhook-authentic
  * verbatim secret. An `invalid` effective scheme means the server has stopped
  * every delivery, and that is said in red to every viewer.
  *
+ * **A scheme switch waits on an explicit confirmation, and a known rejection is
+ * shown under its field** (z8pmx9pyrj). The switch is live on the next event,
+ * so Save opens a confirmation and only its Confirm button sends. A `400` the
+ * reference catalogues is answered with this app's own sentence under the field
+ * it names; the server's text is still never rendered.
+ *
  * Identified by id rather than by a `RegistryDevice`, because an account device
  * row may have no registry entry at all and manufacturing one would be the
  * invented row the account devices surface refuses.
@@ -121,7 +139,12 @@ export function DeviceWebhookDialog({
   const [seed, setSeed] = useState<WebhookFields | null>(null)
   const [changedElsewhere, setChangedElsewhere] = useState(false)
   const [confirmingClear, setConfirmingClear] = useState(false)
+  // Reset by every scheme or URL change, so a confirmation is never re-used
+  // for a switch it was not shown for.
+  const [confirmingScheme, setConfirmingScheme] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
+  // A catalogued 400: a fixed sentence and the field it belongs under.
+  const [rejection, setRejection] = useState<WebhookRejection | null>(null)
 
   const config = useQuery({
     queryKey: deviceWebhookKey(deviceId),
@@ -161,6 +184,8 @@ export function DeviceWebhookDialog({
     setSeed(fields)
     setChangedElsewhere(false)
     setConfirmingClear(false)
+    setConfirmingScheme(false)
+    setRejection(null)
   }
 
   useEffect(() => {
@@ -190,7 +215,9 @@ export function DeviceWebhookDialog({
       setSeed(null)
       setChangedElsewhere(false)
       setConfirmingClear(false)
+      setConfirmingScheme(false)
       setFailure(null)
+      setRejection(null)
     }
   }, [open])
 
@@ -220,13 +247,20 @@ export function DeviceWebhookDialog({
       onOpenChange(false)
     },
     // Never `toApiError(error).message`: this request carried the secret and a
-    // 4xx rejecting it may quote the field it rejected.
-    onError: (error) =>
+    // 4xx rejecting it may quote the field it rejected. A catalogued 400 gets
+    // this app's own sentence under its field; everything else is redacted.
+    onError: (error) => {
+      const rejected = webhookRejectionFrom(error)
+      if (rejected) {
+        setRejection(rejected)
+        return
+      }
       setFailure(
         webhookSaveFailure(error) === 'redacted'
           ? WEBHOOK_SAVE_FAILED_REDACTED
           : toActionErrorMessage(error),
-      ),
+      )
+    },
   })
 
   const toggle = useMutation({
@@ -259,13 +293,25 @@ export function DeviceWebhookDialog({
     storedSecret: secret,
   })
   const invalid = errors.headerName !== null || errors.secret !== null || errors.auth !== null
+  const blocked = invalid || changedElsewhere
+
+  const schemeSwitch = schemeSwitchFrom({
+    url,
+    scheme,
+    seeded: seededScheme,
+    effective: effectiveScheme,
+  })
+  // One predicate for the panel, the footer Save's disabling and the Confirm
+  // guard, so they cannot disagree about whether a confirmation is pending.
+  const showSwitch = confirmingScheme && schemeSwitch !== null
 
   const onSubmit = (event: FormEvent) => {
     event.preventDefault()
     setFailure(null)
+    setRejection(null)
     // The same values the inline messages render, so what is shown and what is
     // refused cannot disagree.
-    if (invalid || changedElsewhere) return
+    if (blocked) return
     // An empty URL is a deletion, and the operator is told what it destroys
     // before it happens. Both the warning and the request read the same
     // function, so they cannot describe different outcomes.
@@ -273,8 +319,25 @@ export function DeviceWebhookDialog({
       setConfirmingClear(true)
       return
     }
+    // A scheme switch is live on the next event: Save only opens the
+    // confirmation, and nothing here sends it.
+    if (schemeSwitch) {
+      setConfirmingScheme(true)
+      return
+    }
     save.mutate()
   }
+
+  const confirmSwitch = () => {
+    if (!showSwitch || blocked || save.isPending) return
+    setFailure(null)
+    setRejection(null)
+    save.mutate()
+  }
+
+  // Same reference when nothing matches, so a keystroke costs no extra render.
+  const clearRejection = (...fields: WebhookField[]) =>
+    setRejection((current) => (current && fields.includes(current.field) ? null : current))
 
   const toggleEvent = (name: string, checked: boolean) =>
     setSelectedEvents((current) =>
@@ -286,17 +349,44 @@ export function DeviceWebhookDialog({
     // sees is the one that is sent.
     setMode(modeAfterSchemeChange(v1, v1InForce(next, seededScheme, effectiveScheme), mode))
     setScheme(next)
+    setConfirmingScheme(false)
+    // The scheme can move the mode, so a mode rejection is stale too.
+    clearRejection('scheme', 'sign')
+  }
+
+  const onModeChange = (next: WebhookAuthMode) => {
+    setMode(next)
+    clearRejection('sign')
+  }
+
+  const onHeaderNameChange = (next: string) => {
+    setHeaderName(next)
+    clearRejection('headerName')
   }
 
   const delivery = config.data ? webhookEnabledFrom(config.data) : null
   const urlNotice = webhookUrlNotice(url)
   const clearing = webhookSaveEffect(url) === 'clear'
+  const seededSign = seed?.sign ?? null
+  const seededV1 = v1InForce(seededScheme, seededScheme, effectiveScheme)
+  const inheritedPlain = inheritedPlainWarning({
+    mode,
+    seededSign,
+    leavingV1: seededV1 && !v1,
+    effective,
+    hasSecret: secretToSend !== '',
+  })
   // The legacy notices describe controls that do not exist under v1.
   const authNotices = (
     v1
       ? [inheritedV1Notice(scheme, v1, replacementSecret, secret)]
-      : [plainWarning(mode, url), inheritedPlainWarning(mode, effective, secretToSend)]
+      : [plainWarning(mode, url), inheritedPlain]
   ).filter((notice): notice is string => notice !== null)
+
+  const rejectedAt =
+    rejection && rejectionShownAt(rejection.field, { v1, schemeShown: scheme !== 'unreported' })
+  const rejectionUnder = (field: WebhookField) =>
+    rejection !== null && rejectedAt === field ? rejection.text : null
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -381,10 +471,16 @@ export function DeviceWebhookDialog({
                   onChange={(event) => {
                     setUrl(event.target.value)
                     setConfirmingClear(false)
+                    setConfirmingScheme(false)
+                    clearRejection('url')
                   }}
                   readOnly={!mayWrite}
+                  aria-invalid={rejectionUnder('url') !== null}
                 />
                 {urlNotice && <p className="text-destructive text-xs">{urlNotice}</p>}
+                {rejectionUnder('url') && (
+                  <p className="text-destructive text-xs">{rejectionUnder('url')}</p>
+                )}
               </div>
 
               <div className="flex flex-col gap-2">
@@ -404,18 +500,24 @@ export function DeviceWebhookDialog({
                       spellCheck={false}
                       placeholder={secret ? 'type a new one to replace it' : 'optional'}
                       value={replacementSecret}
-                      onChange={(event) => setReplacementSecret(event.target.value)}
-                      aria-invalid={errors.secret !== null}
+                      onChange={(event) => {
+                        setReplacementSecret(event.target.value)
+                        clearRejection('secret')
+                      }}
+                      aria-invalid={errors.secret !== null || rejectionUnder('secret') !== null}
                     />
                     <p className="text-muted-foreground text-xs">
                       Signed mode uses it as the HMAC key; Plain mode sends it as the header value.
-                      Agent HMAC v1 uses it as the HMAC key and needs at least 32 characters.
-                      Leave this empty to keep the one already stored. Copy a new value now — it is
-                      not shown again.
+                      Agent HMAC v1 uses it as the HMAC key and needs at least 32 characters. Leave
+                      this empty to keep the one already stored. Copy a new value now — it is not
+                      shown again.
                     </p>
                   </>
                 )}
                 {errors.secret && <p className="text-destructive text-xs">{errors.secret}</p>}
+                {rejectionUnder('secret') && (
+                  <p className="text-destructive text-xs">{rejectionUnder('secret')}</p>
+                )}
               </div>
 
               <WebhookAuthentication
@@ -427,12 +529,13 @@ export function DeviceWebhookDialog({
                 mode={mode}
                 headerName={headerName}
                 mayWrite={mayWrite}
-                headerNameError={errors.headerName}
-                authError={errors.auth}
+                schemeError={rejectionUnder('scheme')}
+                headerNameError={errors.headerName ?? rejectionUnder('headerName')}
+                authError={errors.auth ?? rejectionUnder('sign')}
                 notices={authNotices}
                 onSchemeChange={onSchemeChange}
-                onModeChange={setMode}
-                onHeaderNameChange={setHeaderName}
+                onModeChange={onModeChange}
+                onHeaderNameChange={onHeaderNameChange}
               />
 
               <div className="flex flex-col gap-2">
@@ -490,9 +593,38 @@ export function DeviceWebhookDialog({
                 </div>
               )}
 
+              {showSwitch && schemeSwitch && (
+                <SchemeSwitchConfirmation
+                  // Built every render the panel is shown, so a mode or secret
+                  // changed under it is reflected in what it says.
+                  copy={schemeSwitchConfirmation(
+                    schemeSwitch,
+                    schemeSwitch.to === 'agent_hmac_v1'
+                      ? exposedSecretWarning({
+                          to: schemeSwitch.to,
+                          seededSign,
+                          seededV1,
+                          effective,
+                          replacing: replacementSecret !== '',
+                          hasStoredSecret: secret !== '',
+                        })
+                      : (plainWarning(mode, url) ?? inheritedPlain),
+                  )}
+                  disabled={blocked || save.isPending}
+                  onCancel={() => setConfirmingScheme(false)}
+                  onConfirm={confirmSwitch}
+                />
+              )}
+
               {failure && (
                 <div className="border-destructive/50 text-destructive rounded-lg border p-3 text-xs">
                   {failure}
+                </div>
+              )}
+
+              {rejection && (
+                <div className="border-destructive/50 text-destructive rounded-lg border p-3 text-xs">
+                  {rejectedAt === 'form' ? rejection.text : rejectionPointer(rejection.field)}
                 </div>
               )}
 
@@ -501,7 +633,7 @@ export function DeviceWebhookDialog({
                   <Button
                     type="submit"
                     variant={confirmingClear ? 'destructive' : 'default'}
-                    disabled={save.isPending || invalid || changedElsewhere}
+                    disabled={save.isPending || blocked || showSwitch}
                   >
                     {save.isPending && <Loader2 className="size-4 animate-spin" />}
                     {confirmingClear

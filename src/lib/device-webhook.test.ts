@@ -17,6 +17,7 @@ import {
   effectiveAuthFrom,
   effectiveSchemeFrom,
   effectiveSummary,
+  exposedSecretWarning,
   headerNameError,
   headerNameFrom,
   headerNamePayload,
@@ -25,8 +26,12 @@ import {
   modeAfterSchemeChange,
   parseWebhookEvents,
   plainWarning,
+  rejectionPointer,
+  rejectionShownAt,
   schemeFrom,
   schemeOptionLabel,
+  schemeSwitchConfirmation,
+  schemeSwitchFrom,
   secretError,
   serializeWebhookEvents,
   signFrom,
@@ -37,9 +42,11 @@ import {
   webhookFormEdited,
   webhookFormErrors,
   webhookPayloadFrom,
+  webhookRejectionFrom,
   webhookSaveEffect,
   webhookSaveFailure,
   webhookUrlNotice,
+  type WebhookField,
 } from './device-webhook'
 
 /**
@@ -349,14 +356,45 @@ describe('a mode that needs a secret refuses to go without one (AC-4, AC-17, TC-
     expect(errors).toEqual({ headerName: null, secret: null, auth: null })
   })
 
-  it('warns when inherit resolves to plain and the device has no secret of its own', () => {
+  it('warns when inherit resolves to plain, for whichever secret goes out (z8pmx9pyrj AC-6, TC-5)', () => {
     const plain = { headerName: 'X-A', mode: 'plain' as const }
     const signed = { headerName: 'X-A', mode: 'signed' as const }
-    expect(inheritedPlainWarning('inherit', plain, '')).toMatch(/deployment-wide secret/i)
-    expect(inheritedPlainWarning('inherit', plain, 'own')).toBeNull()
-    expect(inheritedPlainWarning('inherit', signed, '')).toBeNull()
-    expect(inheritedPlainWarning('inherit', null, '')).toBeNull()
-    expect(inheritedPlainWarning('plain', plain, '')).toBeNull()
+    const base = {
+      mode: 'inherit' as const,
+      seededSign: null,
+      leavingV1: false,
+      effective: plain,
+      hasSecret: false,
+    }
+    expect(inheritedPlainWarning(base)).toMatch(/deployment-wide secret/i)
+    // z8pmx9pyrj: the device's own secret is then the one sent verbatim.
+    expect(inheritedPlainWarning({ ...base, hasSecret: true })).toMatch(
+      /own secret is sent verbatim/,
+    )
+    expect(inheritedPlainWarning({ ...base, effective: signed })).toBeNull()
+    expect(inheritedPlainWarning({ ...base, effective: null })).toBeNull()
+    expect(inheritedPlainWarning({ ...base, mode: 'plain' })).toBeNull()
+    expect(inheritedPlainWarning({ ...base, mode: 'signed', leavingV1: true })).toBeNull()
+  })
+
+  it('makes no claim about a default an explicit stored mode hides (TC-5)', () => {
+    const plain = { headerName: 'X-A', mode: 'plain' as const }
+    const base = { mode: 'inherit' as const, leavingV1: false, effective: plain, hasSecret: true }
+    expect(inheritedPlainWarning({ ...base, seededSign: false })).toBeNull()
+    expect(inheritedPlainWarning({ ...base, seededSign: true })).toBeNull()
+  })
+
+  it('says the default is not visible when Inherit is chosen on the way out of v1 (TC-5)', () => {
+    const signed = { headerName: 'X-A', mode: 'signed' as const }
+    expect(
+      inheritedPlainWarning({
+        mode: 'inherit',
+        seededSign: null,
+        leavingV1: true,
+        effective: signed,
+        hasSecret: true,
+      }),
+    ).toMatch(/cannot see the server’s default mode.*Choose Signed/)
   })
 })
 
@@ -847,5 +885,308 @@ describe('"currently sent" cannot contradict the server (AC-14, TC-11)', () => {
 describe('the redacted failure points at what v1 can reject', () => {
   it('names the secret and the scheme, and still quotes nothing', () => {
     expect(WEBHOOK_SAVE_FAILED_REDACTED).toMatch(/secret, the signature scheme/)
+  })
+})
+
+/*
+ * z8pmx9pyrj — the scheme switch is confirmed, and a catalogued rejection is
+ * shown under its field with this app's own words.
+ */
+
+describe('a scheme switch is owed a confirmation only when the scheme changes (AC-1, AC-3, AC-4, AC-13, TC-1, TC-10)', () => {
+  const URL = 'https://example.com/webhook'
+
+  it('asks for a move between the two explicit schemes, both ways', () => {
+    expect(
+      schemeSwitchFrom({
+        url: URL,
+        scheme: 'agent_hmac_v1',
+        seeded: 'legacy',
+        effective: 'legacy',
+      }),
+    ).toEqual({ from: 'legacy', to: 'agent_hmac_v1' })
+    expect(
+      schemeSwitchFrom({
+        url: URL,
+        scheme: 'legacy',
+        seeded: 'agent_hmac_v1',
+        effective: 'agent_hmac_v1',
+      }),
+    ).toEqual({ from: 'agent_hmac_v1', to: 'legacy' })
+  })
+
+  it('does not ask when the select was not moved — a URL- or events-only save', () => {
+    expect(
+      schemeSwitchFrom({
+        url: URL,
+        scheme: 'agent_hmac_v1',
+        seeded: 'agent_hmac_v1',
+        effective: 'agent_hmac_v1',
+      }),
+    ).toBeNull()
+    expect(
+      schemeSwitchFrom({ url: URL, scheme: 'inherit', seeded: 'inherit', effective: null }),
+    ).toBeNull()
+  })
+
+  it('does not ask when both options resolve to the scheme already in force', () => {
+    expect(
+      schemeSwitchFrom({ url: URL, scheme: 'legacy', seeded: 'inherit', effective: 'legacy' }),
+    ).toBeNull()
+    expect(
+      schemeSwitchFrom({
+        url: URL,
+        scheme: 'agent_hmac_v1',
+        seeded: 'inherit',
+        effective: 'agent_hmac_v1',
+      }),
+    ).toBeNull()
+  })
+
+  it('asks with an unresolved end where the default is not visible', () => {
+    // An explicit device moved to Inherit: the deployment default is unknown.
+    expect(
+      schemeSwitchFrom({ url: URL, scheme: 'inherit', seeded: 'legacy', effective: 'legacy' }),
+    ).toEqual({ from: 'legacy', to: null })
+    // An inheriting device whose default was never reported.
+    expect(
+      schemeSwitchFrom({ url: URL, scheme: 'agent_hmac_v1', seeded: 'inherit', effective: null }),
+    ).toEqual({ from: null, to: 'agent_hmac_v1' })
+    // A stored value this UI does not know.
+    expect(
+      schemeSwitchFrom({ url: URL, scheme: 'legacy', seeded: 'unrecognised', effective: 'legacy' }),
+    ).toEqual({ from: null, to: 'legacy' })
+  })
+
+  it('never asks on the deletion, which has its own confirmation', () => {
+    expect(
+      schemeSwitchFrom({
+        url: '  ',
+        scheme: 'agent_hmac_v1',
+        seeded: 'legacy',
+        effective: 'legacy',
+      }),
+    ).toBeNull()
+  })
+
+  it('never asks for a server that does not report the field, or a value kept as stored', () => {
+    expect(
+      schemeSwitchFrom({ url: URL, scheme: 'unreported', seeded: 'unreported', effective: null }),
+    ).toBeNull()
+    expect(
+      schemeSwitchFrom({
+        url: URL,
+        scheme: 'unrecognised',
+        seeded: 'unrecognised',
+        effective: null,
+      }),
+    ).toBeNull()
+  })
+})
+
+describe('the confirmation says what the switch does, per direction (AC-2, AC-7, TC-2, TC-6)', () => {
+  const shared = [/next event after you save/, /no grace period/, /only one scheme per endpoint/]
+
+  it('to v1: the three headers by name or function and the signed string', () => {
+    const copy = schemeSwitchConfirmation({ from: 'legacy', to: 'agent_hmac_v1' }, null)
+    const text = copy.lines.join(' ')
+    expect(copy.title).toMatch(/Agent HMAC v1/)
+    expect(copy.action).toBe('Switch to Agent HMAC v1 and save')
+    expect(text).toContain('the signature header')
+    expect(text).toContain('X-Agent-Timestamp')
+    expect(text).toContain('X-Agent-Request-Id')
+    expect(text).toContain(AGENT_HMAC_V1_SIGNED_STRING)
+    for (const line of shared) expect(text).toMatch(line)
+    expect(text).not.toMatch(/\bmay\b/)
+  })
+
+  it('to Legacy: no replay protection, and the verbatim warning when one applies', () => {
+    const copy = schemeSwitchConfirmation(
+      { from: 'agent_hmac_v1', to: 'legacy' },
+      'A verbatim warning.',
+    )
+    const text = copy.lines.join(' ')
+    expect(copy.action).toBe('Switch to Legacy and save')
+    expect(text).toMatch(/no replay protection/)
+    for (const line of shared) expect(text).toMatch(line)
+    expect(copy.lines.at(-1)).toBe('A verbatim warning.')
+    expect(
+      schemeSwitchConfirmation({ from: 'agent_hmac_v1', to: 'legacy' }, null).lines,
+    ).toHaveLength(3)
+  })
+
+  it('unresolved: says the scheme may change', () => {
+    const toUnknown = schemeSwitchConfirmation({ from: 'legacy', to: null }, null)
+    expect(toUnknown.lines.join(' ')).toMatch(/may change/)
+    expect(toUnknown.action).toBe('Change the scheme and save')
+    const fromUnknown = schemeSwitchConfirmation({ from: null, to: 'legacy' }, null)
+    expect(fromUnknown.lines.join(' ')).toMatch(/may or may not change/)
+    for (const line of shared) expect(toUnknown.lines.join(' ')).toMatch(line)
+  })
+})
+
+describe('switching to v1 with a key that already travelled verbatim asks for a new one (AC-14, TC-11)', () => {
+  const plain = { headerName: 'X-A', mode: 'plain' as const }
+  const signed = { headerName: 'X-A', mode: 'signed' as const }
+  const base = {
+    to: 'agent_hmac_v1' as const,
+    seededSign: false as const,
+    seededV1: false,
+    effective: plain,
+    replacing: false,
+    hasStoredSecret: true,
+  }
+
+  it('warns for a stored Plain mode', () => {
+    expect(exposedSecretWarning(base)).toMatch(/Enter a new secret/)
+  })
+
+  it('warns for an inherited mode the server reports as plain', () => {
+    expect(exposedSecretWarning({ ...base, seededSign: null })).toMatch(/verbatim/)
+  })
+
+  it('is silent once a replacement is typed, with no stored secret, for Signed, or off v1', () => {
+    expect(exposedSecretWarning({ ...base, replacing: true })).toBeNull()
+    expect(exposedSecretWarning({ ...base, hasStoredSecret: false })).toBeNull()
+    expect(exposedSecretWarning({ ...base, seededSign: true })).toBeNull()
+    expect(exposedSecretWarning({ ...base, seededSign: null, effective: signed })).toBeNull()
+    expect(exposedSecretWarning({ ...base, seededSign: null, seededV1: true })).toBeNull()
+    expect(exposedSecretWarning({ ...base, to: 'legacy' })).toBeNull()
+    expect(exposedSecretWarning({ ...base, to: null })).toBeNull()
+  })
+})
+
+describe('leaving v1 for Legacy lands on Signed (AC-5, TC-4)', () => {
+  it('moves inherit and plain to signed', () => {
+    expect(modeAfterSchemeChange(true, false, 'inherit')).toBe('signed')
+    expect(modeAfterSchemeChange(true, false, 'plain')).toBe('signed')
+  })
+})
+
+/** A distinctive secret-like suffix, as the server appends detail to some rows. */
+const SUFFIX = ': k7Qe3vLx9pN2sR8tW4yZ1aB6cD0fG5hJ'
+
+/** The reference catalogue (§11), as the server words it, with the expected field. */
+const CATALOGUE_400: [string, WebhookField][] = [
+  ['webhook_url is required', 'url'],
+  ['webhook_signature_scheme must be one of legacy, agent_hmac_v1, or null to inherit', 'scheme'],
+  ['webhook_signature_scheme must be a string or null', 'scheme'],
+  ['webhook_signature_scheme agent_hmac_v1 requires a webhook_secret for this device', 'secret'],
+  ['webhook_secret: an agent_hmac_v1 key must be at least 32 characters', 'secret'],
+  ['webhook_secret: an agent_hmac_v1 key may not be the shipped placeholder secret', 'secret'],
+  [
+    `webhook_secret: an agent_hmac_v1 key may not equal an AGENT_CALLBACK_KEY entry${SUFFIX}`,
+    'secret',
+  ],
+  [
+    `webhook_signature_scheme agent_hmac_v1 cannot be combined with webhook_sign=false${SUFFIX}`,
+    'sign',
+  ],
+  ['webhook_sign must be true, false or null', 'sign'],
+  [`webhook_sign requires a non-empty webhook_secret for this device${SUFFIX}`, 'secret'],
+  ['webhook_secret must be at most 4096 characters', 'secret'],
+  ['webhook_secret must not contain control characters (including CR, LF and NUL)', 'secret'],
+  ['webhook_header_name must be at most 128 characters', 'headerName'],
+  ['webhook_header_name must be a valid HTTP header field name (RFC 7230 token)', 'headerName'],
+  [
+    'webhook_header_name may not be "Content-Type": it is controlled by the transport',
+    'headerName',
+  ],
+]
+
+function badRequest(message: unknown, extra: Record<string, unknown> = {}): AxiosError {
+  return new AxiosError('failed', 'ERR', undefined, undefined, {
+    status: 400,
+    data: { code: 'BAD_REQUEST', message, ...extra },
+    statusText: '',
+    headers: {},
+    config: { headers: {} },
+  } as never)
+}
+
+describe('a catalogued 400 is shown under its field, in this app’s words (AC-8, TC-7)', () => {
+  it.each(CATALOGUE_400)('%s → %s', (message, field) => {
+    const rejected = webhookRejectionFrom(badRequest(message))
+    expect(rejected?.field).toBe(field)
+    // A sentence of this app's — never the server's text, nor its detail.
+    expect(rejected!.text).not.toContain(message)
+    expect(rejected!.text).not.toContain(SUFFIX.slice(2))
+    expect(rejected!.text).not.toMatch(/webhook_|AGENT_CALLBACK/)
+  })
+
+  it('matches exactly: a near-miss in spacing or case is not a catalogued message', () => {
+    // Each row above already pins the field its message lands under, so a
+    // prefix that captured another row's message would fail there; this pins
+    // that the comparison is exact rather than loose.
+    for (const [message] of CATALOGUE_400) {
+      expect(webhookRejectionFrom(badRequest(` ${message}`))).toBeNull()
+      expect(webhookRejectionFrom(badRequest(message.toUpperCase()))).toBeNull()
+    }
+    const texts = CATALOGUE_400.map(([message]) => webhookRejectionFrom(badRequest(message))!.text)
+    expect(new Set(CATALOGUE_400.map(([m]) => m)).size).toBe(CATALOGUE_400.length)
+    expect(texts.every((text) => text.length > 0)).toBe(true)
+  })
+
+  it('asks for a new secret for the two secret-rule rejections', () => {
+    expect(webhookRejectionFrom(badRequest(CATALOGUE_400[4][0]))!.text).toMatch(
+      /new, longer secret/,
+    )
+    expect(webhookRejectionFrom(badRequest(CATALOGUE_400[6][0]))!.text).toMatch(/enter a new one/)
+  })
+
+  it('works on the plain ApiError the interceptor actually rejects with', () => {
+    for (const [message, field] of CATALOGUE_400) {
+      expect(webhookRejectionFrom({ status: 400, code: 'BAD_REQUEST', message })?.field).toBe(field)
+    }
+  })
+})
+
+describe('anything else keeps the redacted sentence (AC-11, AC-12, TC-9)', () => {
+  it('maps no unknown 400, no other code, and no other status', () => {
+    expect(webhookRejectionFrom(badRequest('webhook_secret is invalid'))).toBeNull()
+    expect(webhookRejectionFrom(badRequest('Invalid request body'))).toBeNull()
+    const message = CATALOGUE_400[4][0]
+    expect(webhookRejectionFrom({ status: 400, code: 'HTTP_ERROR', message })).toBeNull()
+    expect(webhookRejectionFrom({ status: 403, code: 'BAD_REQUEST', message })).toBeNull()
+    expect(webhookRejectionFrom({ status: 500, code: 'BAD_REQUEST', message })).toBeNull()
+    expect(webhookRejectionFrom({ status: 0, code: 'NETWORK_ERROR', message })).toBeNull()
+    expect(webhookSaveFailure(badRequest('webhook_secret is invalid'))).toBe('redacted')
+    expect(webhookSaveFailure(rejection(403))).toBe('redacted')
+    expect(webhookSaveFailure(new Error('Network Error'))).toBe('server')
+  })
+
+  it('reads the HTTP status, never a status in the body', () => {
+    const message = CATALOGUE_400[4][0]
+    // HTTP 400 that claims 200 in its body is still a rejection.
+    expect(webhookRejectionFrom(badRequest(message, { status: 200 }))?.field).toBe('secret')
+    expect(webhookSaveFailure(badRequest(message, { status: 200 }))).toBe('redacted')
+  })
+
+  it('never throws on a malformed body', () => {
+    expect(webhookRejectionFrom(badRequest({ text: 'x' }))).toBeNull()
+    expect(webhookRejectionFrom({ status: 400, code: 7, message: 'x' } as never)).toBeNull()
+    expect(webhookRejectionFrom(badRequest(undefined))).toBeNull()
+  })
+})
+
+describe('a rejection is shown where its field is on screen (AC-9, TC-8)', () => {
+  const shown = { v1: false, schemeShown: true }
+
+  it('falls back to beside Save when the field is not rendered', () => {
+    expect(rejectionShownAt('headerName', { ...shown, v1: true })).toBe('form')
+    expect(rejectionShownAt('sign', { ...shown, v1: true })).toBe('form')
+    expect(rejectionShownAt('scheme', { ...shown, schemeShown: false })).toBe('form')
+  })
+
+  it('is under the field otherwise', () => {
+    for (const field of ['url', 'secret', 'scheme', 'sign', 'headerName'] as const) {
+      expect(rejectionShownAt(field, shown)).toBe(field)
+    }
+    expect(rejectionShownAt('secret', { v1: true, schemeShown: false })).toBe('secret')
+  })
+
+  it('points at the field by its label', () => {
+    expect(rejectionPointer('headerName')).toMatch(/“Header name”/)
+    expect(rejectionPointer('secret')).toMatch(/not saved/)
   })
 })

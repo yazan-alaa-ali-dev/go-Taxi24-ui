@@ -328,6 +328,9 @@ export function secretError(secret: string, source: 'replacement' | 'stored'): s
     : `The secret must ${rule}.`
 }
 
+const SIGNED_NEEDS_SECRET =
+  'Signed delivery needs a secret for this device. Enter one, or choose Inherit.'
+
 /**
  * Why this mode cannot be sent with this secret, or `null`.
  *
@@ -339,9 +342,7 @@ export function secretError(secret: string, source: 'replacement' | 'stored'): s
  */
 export function authSecretError(mode: WebhookAuthMode, secretToSend: string): string | null {
   if (secretToSend !== '') return null
-  if (mode === 'signed') {
-    return 'Signed delivery needs a secret for this device. Enter one, or choose Inherit.'
-  }
+  if (mode === 'signed') return SIGNED_NEEDS_SECRET
   if (mode === 'plain') {
     return 'Plain delivery needs a secret for this device. Without one the server would send its deployment-wide secret, verbatim, to this URL. Enter one, or choose Inherit.'
   }
@@ -384,18 +385,40 @@ export function effectiveAuthFrom(config: DeviceWebhookConfig): EffectiveAuth | 
 export const EFFECTIVE_UNKNOWN =
   'This server did not report the header and mode it will actually use. It may predate per-device authentication settings, in which case the choices below are stored but not applied.'
 
+const INHERITED_PLAIN_DEPLOYMENT_SECRET =
+  'The server default for this device is plain, and this device has no secret of its own — so the deployment-wide secret is sent verbatim to this URL. Set a secret for this device, or choose Signed.'
+const INHERITED_PLAIN_OWN_SECRET =
+  'The server default for this device is plain, so this device’s own secret is sent verbatim in the header on every event — anything that sees one request holds it. Choose Signed unless the receiver requires a static token.'
+const LEAVING_V1_DEFAULT_MODE_UNKNOWN =
+  'This dialog cannot see the server’s default mode for this device: under Agent HMAC v1 the mode the server reports is not the legacy default. If that default is plain, this device’s secret is sent verbatim in the header on every event. Choose Signed to be sure.'
+
 /**
- * Inherit, resolving to plain, with no device secret: the deployment-wide
- * secret goes out verbatim to this URL. Not a refusal — inheriting is the
- * deployment's policy — but the operator is told before they rely on it.
+ * Inherit, resolving to plain: a secret goes out verbatim. Not a refusal —
+ * inheriting is the deployment's policy — but the operator is told before they
+ * rely on it (z8pmx9pyrj widened this from the no-secret case only).
+ *
+ * - **The device's own secret counts.** It is then the one sent verbatim, which
+ *   is exactly the reference's warning about returning to legacy.
+ * - **The effective mode is trusted only when the stored mode inherits.** Beside
+ *   an explicit stored mode it is the device's own choice, and "the server
+ *   default is plain" would be a claim about a value nobody reported.
+ * - **Leaving v1 makes the default invisible.** Under v1 the reported mode
+ *   describes nothing about the legacy default, so Inherit on the way out gets
+ *   an honest "not visible, may be plain" rather than silence.
+ *
+ * Takes booleans, never the secret, so no secret can reach its wording.
  */
-export function inheritedPlainWarning(
-  mode: WebhookAuthMode,
-  effective: EffectiveAuth | null,
-  secretToSend: string,
-): string | null {
-  if (mode !== 'inherit' || effective?.mode !== 'plain' || secretToSend !== '') return null
-  return 'The server default for this device is plain, and this device has no secret of its own — so the deployment-wide secret is sent verbatim to this URL. Set a secret for this device, or choose Signed.'
+export function inheritedPlainWarning(fields: {
+  mode: WebhookAuthMode
+  seededSign: WebhookSign
+  leavingV1: boolean
+  effective: EffectiveAuth | null
+  hasSecret: boolean
+}): string | null {
+  if (fields.mode !== 'inherit') return null
+  if (fields.leavingV1) return LEAVING_V1_DEFAULT_MODE_UNKNOWN
+  if (fields.seededSign !== null || fields.effective?.mode !== 'plain') return null
+  return fields.hasSecret ? INHERITED_PLAIN_OWN_SECRET : INHERITED_PLAIN_DEPLOYMENT_SECRET
 }
 
 /*
@@ -627,6 +650,140 @@ export function effectiveSummary(
 
 /*
  * ---------------------------------------------------------------------------
+ * Switching scheme: confirmed before it goes live (z8pmx9pyrj).
+ *
+ * A scheme change applies to the next event after the save. The backend has no
+ * grace window and cannot send both schemes, so a receiver not yet verifying
+ * the new one fails every delivery from that moment. The confirmation is owed
+ * when the scheme deliveries are *signed under* changes — not when the select
+ * merely moves — and when the dialog cannot tell, it asks with "may".
+ * ---------------------------------------------------------------------------
+ */
+
+export type ResolvedScheme = 'legacy' | 'agent_hmac_v1'
+
+/** Either end is `null` when this dialog cannot see which scheme it is. */
+export interface SchemeSwitch {
+  from: ResolvedScheme | null
+  to: ResolvedScheme | null
+}
+
+/**
+ * The scheme a form state is signed under. Inherit resolves only on a device
+ * that already inherits, by the rule `schemeOptionLabel` and `v1InForce` use:
+ * beside an explicit choice the effective value is the device's own.
+ */
+function resolvedScheme(
+  form: WebhookSchemeState,
+  seeded: WebhookSchemeState,
+  effective: EffectiveScheme | null,
+): ResolvedScheme | null {
+  if (form === 'legacy' || form === 'agent_hmac_v1') return form
+  if (form === 'inherit' && seeded === 'inherit') {
+    if (effective === 'legacy' || effective === 'agent_hmac_v1') return effective
+  }
+  return null
+}
+
+/**
+ * The switch this save would make, or `null` when no confirmation is owed.
+ *
+ * None for a deletion (it has its own confirmation), for a server that does
+ * not report the field, for an unrecognised value the save leaves alone, for a
+ * select that was not moved, and for a move between two options that resolve
+ * to the same scheme. An end that cannot be resolved is kept as `null` and
+ * confirmed — skipping it would fail open on the case the operator cannot see.
+ */
+export function schemeSwitchFrom(fields: {
+  url: string
+  scheme: WebhookSchemeState
+  seeded: WebhookSchemeState
+  effective: EffectiveScheme | null
+}): SchemeSwitch | null {
+  const { scheme, seeded, effective } = fields
+  if (webhookSaveEffect(fields.url) === 'clear') return null
+  if (scheme === 'unreported' || scheme === 'unrecognised' || scheme === seeded) return null
+  const from = resolvedScheme(seeded, seeded, effective)
+  const to = resolvedScheme(scheme, seeded, effective)
+  return from !== null && from === to ? null : { from, to }
+}
+
+const SWITCH_IMMEDIATE =
+  'The change takes effect on the next event after you save. There is no grace period, and the server cannot send both schemes at once.'
+const SWITCH_ONE_SCHEME =
+  'A receiver must accept only one scheme per endpoint: one that also accepts the other can be downgraded by anyone able to send it a request signed the weaker way.'
+const SWITCH_FROM_UNKNOWN =
+  'The scheme this device uses today is not visible here, so this may or may not change what the receiver gets.'
+const SWITCH_TO_V1 = `Your receiver must already verify all three Agent HMAC v1 headers — the signature header, ${AGENT_HMAC_V1_HEADERS.join(' and ')} — with the HMAC computed over ${AGENT_HMAC_V1_SIGNED_STRING}. If it does not, every delivery from that moment fails.`
+const SWITCH_TO_LEGACY =
+  'Your receiver must already accept Legacy deliveries — the header and mode below — and stop requiring the Agent HMAC v1 headers. Legacy has no replay protection: a captured request can be sent again and still verifies.'
+const SWITCH_TO_UNKNOWN =
+  'Inherit follows the deployment’s default scheme, which this dialog cannot see until the change is saved — so the scheme deliveries are signed under may change on the next event. Make sure the receiver is ready for whichever it is.'
+
+export interface SchemeSwitchCopy {
+  title: string
+  lines: string[]
+  action: string
+}
+
+/**
+ * What the confirmation says, for one direction. `warning` is the verbatim
+ * warning for a Legacy or unresolved target, the exposed-secret warning for a
+ * v1 target, and is appended last so it is the line read just before Confirm.
+ */
+export function schemeSwitchConfirmation(
+  change: SchemeSwitch,
+  warning: string | null,
+): SchemeSwitchCopy {
+  const from = change.from === null ? [SWITCH_FROM_UNKNOWN] : []
+  const tail = [SWITCH_IMMEDIATE, SWITCH_ONE_SCHEME, ...(warning === null ? [] : [warning])]
+  if (change.to === 'agent_hmac_v1') {
+    return {
+      title: 'Switch this device to Agent HMAC v1?',
+      lines: [SWITCH_TO_V1, ...from, ...tail],
+      action: 'Switch to Agent HMAC v1 and save',
+    }
+  }
+  if (change.to === 'legacy') {
+    return {
+      title: 'Switch this device to Legacy?',
+      lines: [SWITCH_TO_LEGACY, ...from, ...tail],
+      action: 'Switch to Legacy and save',
+    }
+  }
+  return {
+    title: 'Change this device’s signature scheme?',
+    lines: [SWITCH_TO_UNKNOWN, ...tail],
+    action: 'Change the scheme and save',
+  }
+}
+
+const EXPOSED_SECRET =
+  'The secret stored for this device is sent verbatim under its current mode, so anyone who saw one of those deliveries holds it — and under Agent HMAC v1 it would be the signing key. Enter a new secret before switching, and give it to the receiver.'
+
+/**
+ * A switch to v1 keeping a key that has already travelled as a header value.
+ * v1's signature proves nothing when whoever saw one legacy delivery holds the
+ * key, so the confirmation asks for a new secret. Not a refusal: rotating may
+ * have to be coordinated with the receiver. Booleans only — no secret enters.
+ */
+export function exposedSecretWarning(fields: {
+  to: ResolvedScheme | null
+  seededSign: WebhookSign
+  seededV1: boolean
+  effective: EffectiveAuth | null
+  replacing: boolean
+  hasStoredSecret: boolean
+}): string | null {
+  if (fields.to !== 'agent_hmac_v1' || fields.replacing || !fields.hasStoredSecret) return null
+  if (fields.seededSign === false) return EXPOSED_SECRET
+  const inheritedPlain =
+    fields.seededSign === null && !fields.seededV1 && fields.effective?.mode === 'plain'
+  return inheritedPlain ? EXPOSED_SECRET : null
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Events: a fixed catalogue, and the stored names it does not know.
  * ---------------------------------------------------------------------------
  */
@@ -807,7 +964,8 @@ export function webhookFormErrors(fields: {
     return {
       headerName: null,
       secret:
-        format ?? (fields.scheme === 'agent_hmac_v1' ? agentSecretError(secretToSend, source) : null),
+        format ??
+        (fields.scheme === 'agent_hmac_v1' ? agentSecretError(secretToSend, source) : null),
       auth: null,
     }
   }
@@ -816,4 +974,154 @@ export function webhookFormErrors(fields: {
     secret: format,
     auth: authSecretError(fields.mode, secretToSend),
   }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Server rejections, per field (z8pmx9pyrj).
+ *
+ * A `400` from this save names the field it rejects, in a fixed catalogue
+ * (reference §11). Its text is still never rendered — this request carried the
+ * secret — so a **known** message is answered with this module's own sentence
+ * under the field it names, and everything else keeps the redacted sentence.
+ * ---------------------------------------------------------------------------
+ */
+
+export type WebhookField = 'url' | 'secret' | 'scheme' | 'sign' | 'headerName'
+
+export interface WebhookRejection {
+  field: WebhookField
+  text: string
+}
+
+const SCHEME_NOT_ACCEPTED =
+  'The server did not accept this signature scheme. Choose Inherit, Legacy or Agent HMAC v1, and save again.'
+
+/**
+ * The catalogue, as exact prefixes. Case-sensitive and untrimmed: it is the
+ * server's fixed text, and a looser match is how a message meant for one field
+ * lands under another. The callback-key row stops before the server's
+ * environment-variable name, which this bundle does not spell.
+ */
+const REJECTIONS: readonly { prefix: string; field: WebhookField; text: string }[] = [
+  {
+    prefix: 'webhook_url is required',
+    field: 'url',
+    text: 'The server did not receive a webhook URL. Enter the URL to deliver this device’s events to, and save again.',
+  },
+  {
+    prefix: 'webhook_signature_scheme must be one of',
+    field: 'scheme',
+    text: SCHEME_NOT_ACCEPTED,
+  },
+  {
+    prefix: 'webhook_signature_scheme must be a string or null',
+    field: 'scheme',
+    text: SCHEME_NOT_ACCEPTED,
+  },
+  {
+    prefix: 'webhook_signature_scheme agent_hmac_v1 requires a webhook_secret',
+    field: 'secret',
+    text: AGENT_SECRET_REQUIRED,
+  },
+  {
+    prefix: 'webhook_secret: an agent_hmac_v1 key must be at least 32 characters',
+    field: 'secret',
+    text: `The server refused this secret: an Agent HMAC v1 key must be at least ${AGENT_HMAC_V1_SECRET_MIN} characters, not counting spaces at either end. Enter a new, longer secret.`,
+  },
+  {
+    prefix: 'webhook_secret: an agent_hmac_v1 key may not be the shipped placeholder',
+    field: 'secret',
+    text: 'The server refused this secret: it is the placeholder value the server ships with. Enter a new secret.',
+  },
+  {
+    prefix: 'webhook_secret: an agent_hmac_v1 key may not equal an ',
+    field: 'secret',
+    text: 'The server refused this secret because it is already in use as a key for calls into this server. A delivery secret must be unique — enter a new one for this device.',
+  },
+  {
+    prefix: 'webhook_signature_scheme agent_hmac_v1 cannot be combined with webhook_sign=false',
+    field: 'sign',
+    text: 'The server applies Agent HMAC v1 to this device, which cannot be combined with Plain. Choose Signed or Inherit, and save again.',
+  },
+  {
+    prefix: 'webhook_sign must be true, false or null',
+    field: 'sign',
+    text: 'The server did not accept this mode. Choose Inherit, Signed or Plain, and save again.',
+  },
+  {
+    prefix: 'webhook_sign requires a non-empty webhook_secret',
+    field: 'secret',
+    text: SIGNED_NEEDS_SECRET,
+  },
+  {
+    prefix: 'webhook_secret must be at most 4096 characters',
+    field: 'secret',
+    text: `The server refused this secret: a secret may be at most ${SECRET_MAX} characters.`,
+  },
+  {
+    prefix: 'webhook_secret must not contain control characters',
+    field: 'secret',
+    text: 'The server refused this secret: it must contain no control characters, such as line breaks.',
+  },
+  {
+    prefix: 'webhook_header_name must be at most 128 characters',
+    field: 'headerName',
+    text: `The server refused this header name: it may be at most ${HEADER_NAME_MAX} characters.`,
+  },
+  {
+    prefix: 'webhook_header_name must be a valid HTTP header field name',
+    field: 'headerName',
+    text: "The server refused this header name: it may contain only ASCII letters, digits and ! # $ % & ' * + - . ^ _ ` | ~.",
+  },
+  {
+    prefix: 'webhook_header_name may not be "',
+    field: 'headerName',
+    text: 'The server refused this header name: it is set by the transport itself and cannot carry the credential. Choose another.',
+  },
+]
+
+/**
+ * The field a failed save names, and this module's sentence for it — or `null`
+ * for anything that is not a known `400 BAD_REQUEST`, which then keeps
+ * `webhookSaveFailure`'s redaction.
+ *
+ * Reads the HTTP status and the body `code` only; a body `status` is never
+ * consulted (reference §5.2). The server's message is only ever an argument to
+ * `startsWith`: what is returned is a constant from the table above. The type
+ * checks keep a malformed body from throwing inside a mutation's `onError`.
+ */
+export function webhookRejectionFrom(error: unknown): WebhookRejection | null {
+  const { status, code, message } = toApiError(error)
+  if (typeof code !== 'string' || typeof message !== 'string') return null
+  if (status !== 400 || code !== 'BAD_REQUEST') return null
+  const hit = REJECTIONS.find((entry) => message.startsWith(entry.prefix))
+  return hit ? { field: hit.field, text: hit.text } : null
+}
+
+/**
+ * Where a rejection is shown: under its field, or beside Save when that field
+ * is not on screen — the mode and header are not rendered under v1, and the
+ * scheme is not rendered for a server that does not report it.
+ */
+export function rejectionShownAt(
+  field: WebhookField,
+  form: { v1: boolean; schemeShown: boolean },
+): WebhookField | 'form' {
+  if ((field === 'headerName' || field === 'sign') && form.v1) return 'form'
+  if (field === 'scheme' && !form.schemeShown) return 'form'
+  return field
+}
+
+const WEBHOOK_FIELD_LABELS: Record<WebhookField, string> = {
+  url: 'Webhook URL',
+  secret: 'Secret',
+  scheme: 'Signature scheme',
+  sign: 'Mode',
+  headerName: 'Header name',
+}
+
+/** The line beside Save when the sentence itself is under a field. */
+export function rejectionPointer(field: WebhookField): string {
+  return `The webhook was not saved — see the message under “${WEBHOOK_FIELD_LABELS[field]}”.`
 }
