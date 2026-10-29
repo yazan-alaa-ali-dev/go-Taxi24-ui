@@ -11,6 +11,17 @@ import { http, results } from '@/lib/http'
  */
 export type WebhookSign = boolean | null
 
+/**
+ * The two signature schemes a device can name (z8pmx9pyre).
+ *
+ * `legacy` is the scheme above: `webhook_sign` and `webhook_header_name` decide
+ * what is sent. `agent_hmac_v1` ignores both and always sends three fixed
+ * headers — `X-Agent-Signature`, `X-Agent-Timestamp`, `X-Agent-Request-Id` — with
+ * an HMAC-SHA256 over `timestamp.request_id.raw_body`, which gives the receiver
+ * replay protection. A stored `""` or `null` inherits the deployment default.
+ */
+export type WebhookSignatureScheme = 'legacy' | 'agent_hmac_v1'
+
 export interface AddDevicePayload {
   device_id?: string
   webhook_url?: string
@@ -95,6 +106,13 @@ export interface DeviceWebhookSettings {
   webhook_header_name?: string | null
   /** See `WebhookSign`. Absent on a deployment predating the field. */
   webhook_sign?: WebhookSign
+  /**
+   * See `WebhookSignatureScheme`; `""` or `null` inherits. Read as a plain
+   * string rather than the union: a newer server may store a value this UI does
+   * not know, and typing it as closed would hide that case from the compiler
+   * while it stays reachable at runtime. Absent on a deployment predating it.
+   */
+  webhook_signature_scheme?: string | null
 }
 
 /**
@@ -120,6 +138,11 @@ export interface DeviceWebhookConfig extends DeviceWebhookSettings {
    */
   effective_webhook_header_name?: string
   effective_webhook_sign?: boolean
+  /**
+   * `legacy`, `agent_hmac_v1` or `invalid`. **`invalid` means every delivery for
+   * this device is stopped** until its configuration is fixed. `GET` only.
+   */
+  effective_webhook_signature_scheme?: string
 }
 
 export interface UpdateDeviceWebhookPayload {
@@ -139,8 +162,13 @@ export interface UpdateDeviceWebhookPayload {
    * stored value, and only an explicit `null` (or `""`) resets it to inherit.
    */
   webhook_header_name?: string | null
-  /** Absent-preserving, like the header name. `null` resets to inherit. */
+  /**
+   * Absent-preserving, like the header name. `null` resets to inherit. Under
+   * `agent_hmac_v1` an explicit `false` is refused.
+   */
   webhook_sign?: WebhookSign
+  /** Absent-preserving, like the header name. `null` resets to inherit. */
+  webhook_signature_scheme?: WebhookSignatureScheme | null
 }
 
 export async function getDeviceWebhook(deviceId: string): Promise<DeviceWebhookConfig> {

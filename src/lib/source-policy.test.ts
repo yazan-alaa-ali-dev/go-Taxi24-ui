@@ -2113,3 +2113,52 @@ describe('the debug toggle spends a secret it must never hold (z8pmx9mw2x)', () 
     ).toBe(false)
   })
 })
+
+describe('the signature scheme re-reads what it changed and alarms every viewer (z8pmx9pyre)', () => {
+  const WEBHOOK_DIALOG = 'src/features/devices/webhook-dialog.tsx'
+  const WEBHOOK_AUTH = 'src/features/devices/webhook-authentication.tsx'
+
+  function sourceOf(path: string): string {
+    const found = SOURCES.find(([candidate]) => candidate === path)
+    expect(found, `${path} should be in the module graph`).toBeTruthy()
+    return found![1]
+  }
+
+  it('RULE: a successful save invalidates exactly this device’s webhook read', () => {
+    // AC-10. The PATCH response carries no effective_* fields, so the effective
+    // scheme, header and sign on screen are only true after a re-read. The
+    // dialog has the same call twice — in the save and in the delivery toggle —
+    // so the match is scoped to the save's own block: a rule that only checked
+    // presence would pass after the save's call was deleted. The exact key, not
+    // a prefix, so a save cannot fan out to every device's cached read.
+    const save = /const save = useMutation\(\{([\s\S]*?)const toggle = useMutation/.exec(
+      sourceOf(WEBHOOK_DIALOG),
+    )
+    expect(save, 'the save mutation is declared before the toggle').toBeTruthy()
+    expect(save![1]).toMatch(
+      /onSuccess:[\s\S]*invalidateQueries\(\{\s*queryKey:\s*deviceWebhookKey\(deviceId\)\s*\}\)/,
+    )
+  })
+
+  it('RULE: the invalid-scheme alert is rendered for every viewer', () => {
+    // AC-3. `invalid` means every delivery for this device is stopped; a viewer
+    // holding only devices.webhook.read is exactly who must be able to report
+    // it. Its markup — role="alert", no dismiss control — is asserted by a
+    // real render in webhook-authentication.test.tsx; this pins only that the
+    // dialog mounts it unguarded (`stripAriaRole` makes role="alert" invisible
+    // here anyway).
+    const dialog = sourceOf(WEBHOOK_DIALOG)
+    expect(dialog).toMatch(/<SchemeInvalidWarning\b/)
+    expect(/mayWrite\s*&&\s*(\(\s*)?<SchemeInvalidWarning/.test(dialog)).toBe(false)
+  })
+
+  it('RULE: no secret crosses into the authentication section', () => {
+    // The section only receives the error and notice strings computed from the
+    // secret. Holding the secret itself would make it one prop away from a
+    // rendered node, beside the rule that the stored secret is never rendered.
+    expect(
+      /\b(secret|secretToSend|replacementSecret|storedSecret)\b/.test(sourceOf(WEBHOOK_AUTH)),
+      'pass the computed error strings, not the secret',
+    ).toBe(false)
+  })
+})

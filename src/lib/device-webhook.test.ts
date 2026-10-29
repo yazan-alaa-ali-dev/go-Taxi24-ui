@@ -2,24 +2,35 @@ import { AxiosError } from 'axios'
 import { describe, expect, it } from 'vitest'
 import type { DeviceWebhookConfig } from '@/api/devices'
 import {
+  AGENT_HMAC_V1_SIGNED_STRING,
   CLEARS_WEBHOOK_WARNING,
   DISABLED_MEANS,
+  EFFECTIVE_UNKNOWN,
   ENABLING_RESUMES,
   INSECURE_SKIP_VERIFY_MEANS,
+  SCHEME_INVALID_WARNING,
   WEBHOOK_EVENTS,
   WEBHOOK_SAVE_FAILED_REDACTED,
+  agentSecretError,
   authModeFrom,
   authSecretError,
   effectiveAuthFrom,
+  effectiveSchemeFrom,
+  effectiveSummary,
   headerNameError,
   headerNameFrom,
   headerNamePayload,
   inheritedPlainWarning,
+  inheritedV1Notice,
+  modeAfterSchemeChange,
   parseWebhookEvents,
   plainWarning,
+  schemeFrom,
+  schemeOptionLabel,
   secretError,
   serializeWebhookEvents,
   signFrom,
+  v1InForce,
   webhookEnabledFrom,
   webhookFieldsDiffer,
   webhookFieldsFrom,
@@ -47,6 +58,13 @@ function config(extra: Partial<DeviceWebhookConfig> = {}): DeviceWebhookConfig {
     ...extra,
   }
 }
+
+/**
+ * A server that predates the signature scheme: no scheme key read, none sent,
+ * no v1 in force. The z8pmx9p135 cases below run on this path, which is also
+ * AC-12's assertion that such a server sees exactly the body it saw before.
+ */
+const OLD_SERVER = { scheme: 'unreported', v1: false } as const
 
 function rejection(status: number): AxiosError {
   return new AxiosError('failed', 'ERR', undefined, undefined, {
@@ -140,6 +158,7 @@ describe('the save payload keeps the empty URL and the stored secret', () => {
       insecureSkipVerify: false,
       headerName: '',
       mode: 'inherit',
+      ...OLD_SERVER,
     })
     expect(payload).toHaveProperty('webhook_url', '')
     expect(Object.keys(payload)).toContain('webhook_url')
@@ -155,6 +174,7 @@ describe('the save payload keeps the empty URL and the stored secret', () => {
       insecureSkipVerify: true,
       headerName: '',
       mode: 'inherit',
+      ...OLD_SERVER,
     })
     expect(payload.webhook_secret).toBe('  padded-secret  ')
     expect(payload.webhook_events).toBe('message')
@@ -267,6 +287,7 @@ describe('every save states all six fields (AC-3, AC-15, TC-3, TC-11)', () => {
     insecureSkipVerify: false,
     headerName: '  ',
     mode: 'inherit' as const,
+    ...OLD_SERVER,
   }
 
   it('sends the two absent-preserving keys explicitly, as null when inheriting', () => {
@@ -323,6 +344,7 @@ describe('a mode that needs a secret refuses to go without one (AC-4, AC-17, TC-
       mode: 'signed',
       replacementSecret: '',
       storedSecret: 'stored',
+      ...OLD_SERVER,
     })
     expect(errors).toEqual({ headerName: null, secret: null, auth: null })
   })
@@ -398,6 +420,7 @@ describe('the secret is checked without ever being quoted (AC-6, TC-6)', () => {
         mode: 'inherit',
         replacementSecret: '',
         storedSecret: `${secret}\n`,
+        ...OLD_SERVER,
       }).secret,
     ).toMatch(/Enter a replacement/i)
   })
@@ -410,6 +433,7 @@ describe('the secret is checked without ever being quoted (AC-6, TC-6)', () => {
         mode: 'inherit',
         replacementSecret: 'fresh',
         storedSecret: `${secret}\n`,
+        ...OLD_SERVER,
       }).secret,
     ).toBeNull()
   })
@@ -422,6 +446,7 @@ describe('the secret is checked without ever being quoted (AC-6, TC-6)', () => {
         mode: 'signed',
         replacementSecret: '',
         storedSecret: '',
+        ...OLD_SERVER,
       }),
     ).toEqual({ headerName: null, secret: null, auth: null })
   })
@@ -522,10 +547,305 @@ describe('a later read only matters when it changes the form (AC-9, AC-14, TC-9)
       headerName: seed.headerName,
       replacementSecret: '',
       mode: 'signed' as const,
+      scheme: seed.scheme,
     }
     expect(webhookFormEdited(seed, untouched)).toBe(false)
     expect(webhookFormEdited(seed, { ...untouched, mode: 'plain' })).toBe(true)
     expect(webhookFormEdited(seed, { ...untouched, headerName: 'X-B' })).toBe(true)
     expect(webhookFormEdited(seed, { ...untouched, replacementSecret: 'n' })).toBe(true)
+  })
+})
+
+/*
+ * z8pmx9pyre — the signature scheme, and the scheme the server says it uses.
+ */
+
+/** Every 4-character window of `secret`: no message may contain any of them. */
+function fragmentsOf(secret: string): string[] {
+  const fragments: string[] = []
+  for (let i = 0; i + 4 <= secret.length; i++) fragments.push(secret.slice(i, i + 4))
+  return fragments
+}
+
+describe('the stored scheme reaches the form in four states (AC-1, AC-12, AC-13, TC-1)', () => {
+  it('reads every spelling of inherit, and the two schemes', () => {
+    expect(schemeFrom('')).toBe('inherit')
+    expect(schemeFrom(null)).toBe('inherit')
+    expect(schemeFrom('legacy')).toBe('legacy')
+    expect(schemeFrom('agent_hmac_v1')).toBe('agent_hmac_v1')
+  })
+
+  it('keeps a server that predates the field apart from one sending a value it does not know', () => {
+    expect(schemeFrom(undefined)).toBe('unreported')
+    expect(schemeFrom('agent_hmac_v2')).toBe('unrecognised')
+    expect(webhookFieldsFrom(config()).scheme).toBe('unreported')
+  })
+})
+
+describe('the effective scheme is reported, never guessed (AC-2, AC-3, TC-2, TC-3)', () => {
+  it('reads the three documented values and keeps an unknown one apart from absent', () => {
+    const read = (value: string) =>
+      effectiveSchemeFrom(config({ effective_webhook_signature_scheme: value }))
+    expect(read('legacy')).toBe('legacy')
+    expect(read('agent_hmac_v1')).toBe('agent_hmac_v1')
+    expect(read('invalid')).toBe('invalid')
+    expect(read('v9')).toBe('unrecognised')
+    expect(effectiveSchemeFrom(config())).toBeNull()
+  })
+
+  it('names the inherited scheme only when the device actually inherits', () => {
+    expect(schemeOptionLabel('inherit', 'inherit', 'legacy')).toBe('Inherit (currently: legacy)')
+    expect(schemeOptionLabel('inherit', 'inherit', 'agent_hmac_v1')).toBe(
+      'Inherit (currently: agent_hmac_v1)',
+    )
+    // The effective value is the device's own choice here, not the default.
+    expect(schemeOptionLabel('inherit', 'agent_hmac_v1', 'agent_hmac_v1')).toBe('Inherit')
+    expect(schemeOptionLabel('inherit', 'inherit', null)).toBe('Inherit')
+    expect(schemeOptionLabel('inherit', 'inherit', 'invalid')).toBe('Inherit')
+    expect(schemeOptionLabel('inherit', 'inherit', 'unrecognised')).toBe('Inherit')
+    expect(schemeOptionLabel('legacy', 'inherit', 'legacy')).toBe('Legacy')
+    expect(schemeOptionLabel('agent_hmac_v1', 'inherit', 'legacy')).toBe('Agent HMAC v1')
+  })
+
+  it('says delivery is stopped without assuming the reader can fix it', () => {
+    expect(SCHEME_INVALID_WARNING).toMatch(/no events are delivered/i)
+    expect(SCHEME_INVALID_WARNING).toMatch(/until the configuration is fixed/i)
+    expect(SCHEME_INVALID_WARNING).not.toMatch(/below/i)
+  })
+})
+
+describe('v1 is in force when chosen, or inherited and reported (AC-4, AC-16, TC-13)', () => {
+  it('follows an explicit choice', () => {
+    expect(v1InForce('agent_hmac_v1', 'legacy', 'legacy')).toBe(true)
+    expect(v1InForce('legacy', 'agent_hmac_v1', 'agent_hmac_v1')).toBe(false)
+  })
+
+  it('follows Inherit only on a device that inherits and whose server said v1', () => {
+    expect(v1InForce('inherit', 'inherit', 'agent_hmac_v1')).toBe(true)
+    expect(v1InForce('inherit', 'inherit', 'legacy')).toBe(false)
+    expect(v1InForce('inherit', 'inherit', null)).toBe(false)
+    // Effective v1 here is the device's own explicit choice, not the default.
+    expect(v1InForce('inherit', 'agent_hmac_v1', 'agent_hmac_v1')).toBe(false)
+    expect(v1InForce('unreported', 'unreported', null)).toBe(false)
+  })
+})
+
+describe('leaving v1 lands on Signed (AC-15, TC-12)', () => {
+  it('sets Signed when v1 goes out of force, whatever the mode was', () => {
+    expect(modeAfterSchemeChange(true, false, 'inherit')).toBe('signed')
+    expect(modeAfterSchemeChange(true, false, 'plain')).toBe('signed')
+  })
+
+  it('leaves the mode alone otherwise', () => {
+    expect(modeAfterSchemeChange(true, true, 'inherit')).toBe('inherit')
+    expect(modeAfterSchemeChange(false, false, 'plain')).toBe('plain')
+    expect(modeAfterSchemeChange(false, true, 'plain')).toBe('plain')
+  })
+})
+
+describe('an Agent HMAC v1 key is checked the way the server keys it (AC-5, TC-5)', () => {
+  const key = 'Qz7mK2pX9vR4tW8yB1nC6dF3gH5jL0sA'
+
+  it('counts after trimming, in code points', () => {
+    expect(key).toHaveLength(32)
+    expect(agentSecretError(key, 'replacement')).toBeNull()
+    expect(agentSecretError(`  ${key}  `, 'replacement')).toBeNull()
+    expect(agentSecretError(key.slice(1), 'replacement')).toMatch(/at least 32/)
+    expect(agentSecretError(`  ${key.slice(1)}   `, 'replacement')).toMatch(/at least 32/)
+    // 31 astral characters are 62 UTF-16 units, and still 31 characters.
+    expect(agentSecretError('😀'.repeat(31), 'replacement')).toMatch(/at least 32/)
+    expect(agentSecretError('😀'.repeat(32), 'replacement')).toBeNull()
+  })
+
+  it('names the placeholder before the length, and requires a secret at all', () => {
+    expect(agentSecretError(' secret ', 'replacement')).toMatch(/placeholder/i)
+    expect(agentSecretError(' secret ', 'replacement')).not.toMatch(/at least/)
+    expect(agentSecretError('', 'stored')).toMatch(/needs a secret of its own/i)
+    expect(agentSecretError('   ', 'replacement')).toMatch(/needs a secret of its own/i)
+  })
+
+  it('asks for a replacement when the stored secret is the one that fails', () => {
+    expect(agentSecretError('short', 'stored')).toMatch(/Enter a replacement/)
+    expect(agentSecretError('secret', 'stored')).toMatch(/Enter a replacement/)
+  })
+
+  it('never quotes any part of the secret', () => {
+    const secret = 'Zr8!unique-WEBHOOK-material'
+    for (const source of ['replacement', 'stored'] as const) {
+      const message = agentSecretError(secret, source) ?? ''
+      expect(message).not.toBe('')
+      for (const fragment of fragmentsOf(secret)) expect(message).not.toContain(fragment)
+    }
+  })
+})
+
+describe('the form errors follow the scheme in force (AC-5, AC-6, AC-9, AC-16, TC-5, TC-6, TC-8)', () => {
+  const base = {
+    url: 'https://example.com/webhook',
+    headerName: 'Not A Header',
+    mode: 'plain' as const,
+    replacementSecret: '',
+    storedSecret: 'short',
+  }
+
+  it('blocks an explicit v1 on the key, under the secret, and ignores the hidden controls', () => {
+    const errors = webhookFormErrors({ ...base, scheme: 'agent_hmac_v1', v1: true })
+    expect(errors.secret).toMatch(/32/)
+    expect(errors.headerName).toBeNull()
+    expect(errors.auth).toBeNull()
+  })
+
+  it('still applies the format rule first', () => {
+    const errors = webhookFormErrors({
+      ...base,
+      scheme: 'agent_hmac_v1',
+      v1: true,
+      replacementSecret: `${'k'.repeat(40)}\n`,
+    })
+    expect(errors.secret).toMatch(/control characters/)
+  })
+
+  it('does not block an inherited v1, and says what it costs instead', () => {
+    const errors = webhookFormErrors({ ...base, scheme: 'inherit', v1: true })
+    expect(errors).toEqual({ headerName: null, secret: null, auth: null })
+    expect(inheritedV1Notice('inherit', true, '', 'short')).toMatch(/delivery stays stopped/)
+    expect(inheritedV1Notice('inherit', true, '', 'k'.repeat(32))).toBeNull()
+    expect(inheritedV1Notice('agent_hmac_v1', true, '', 'short')).toBeNull()
+    expect(inheritedV1Notice('inherit', false, '', 'short')).toBeNull()
+  })
+
+  it('keeps the legacy rules when v1 is not in force', () => {
+    const errors = webhookFormErrors({ ...base, scheme: 'legacy', v1: false })
+    expect(errors.headerName).not.toBeNull()
+    expect(errors.secret).toBeNull()
+  })
+
+  it('blocks nothing on a deletion, v1 included', () => {
+    expect(
+      webhookFormErrors({ ...base, url: '', storedSecret: '', scheme: 'agent_hmac_v1', v1: true }),
+    ).toEqual({ headerName: null, secret: null, auth: null })
+  })
+})
+
+describe('the scheme is stated on every save (AC-7, AC-8, AC-9, AC-12, AC-13, TC-7, TC-8, TC-10)', () => {
+  const form = {
+    url: 'https://example.com/webhook',
+    secret: 'super-secret-key',
+    events: '',
+    insecureSkipVerify: false,
+    headerName: 'X-Custom',
+    mode: 'plain' as const,
+  }
+
+  it('sends the key for each choice, null for Inherit', () => {
+    expect(webhookPayloadFrom({ ...form, scheme: 'inherit', v1: false })).toHaveProperty(
+      'webhook_signature_scheme',
+      null,
+    )
+    expect(webhookPayloadFrom({ ...form, scheme: 'legacy', v1: false })).toHaveProperty(
+      'webhook_signature_scheme',
+      'legacy',
+    )
+    expect(webhookPayloadFrom({ ...form, scheme: 'agent_hmac_v1', v1: true })).toHaveProperty(
+      'webhook_signature_scheme',
+      'agent_hmac_v1',
+    )
+  })
+
+  it('sends the hidden controls as their reset value under v1 — never sign false', () => {
+    for (const scheme of ['agent_hmac_v1', 'inherit'] as const) {
+      const payload = webhookPayloadFrom({ ...form, scheme, v1: true })
+      expect(payload.webhook_sign).toBeNull()
+      expect(payload.webhook_header_name).toBeNull()
+    }
+    const legacy = webhookPayloadFrom({ ...form, scheme: 'legacy', v1: false })
+    expect(legacy.webhook_sign).toBe(false)
+    expect(legacy.webhook_header_name).toBe('X-Custom')
+  })
+
+  it('omits the key for a server that predates it, and for a value it does not know', () => {
+    for (const scheme of ['unreported', 'unrecognised'] as const) {
+      const payload = webhookPayloadFrom({ ...form, scheme, v1: false })
+      expect(Object.keys(payload)).not.toContain('webhook_signature_scheme')
+      expect(Object.keys(payload)).toHaveLength(6)
+    }
+  })
+
+  it('resets the scheme on a deletion — except where the server would not know the key', () => {
+    const cleared = webhookPayloadFrom({ ...form, url: '', scheme: 'agent_hmac_v1', v1: true })
+    expect(cleared).toHaveProperty('webhook_signature_scheme', null)
+    expect(cleared.webhook_sign).toBeNull()
+    expect(cleared.webhook_header_name).toBeNull()
+    expect(
+      webhookPayloadFrom({ ...form, url: '', scheme: 'unrecognised', v1: false }),
+    ).toHaveProperty('webhook_signature_scheme', null)
+    expect(
+      Object.keys(webhookPayloadFrom({ ...form, url: '', scheme: 'unreported', v1: false })),
+    ).not.toContain('webhook_signature_scheme')
+  })
+})
+
+describe('the scheme takes part in edit detection (AC-11, TC-10)', () => {
+  const seed = webhookFieldsFrom(config({ webhook_signature_scheme: '' }))
+
+  it('sees a re-read that changes only the stored scheme', () => {
+    expect(seed.scheme).toBe('inherit')
+    const reread = (stored: string | null) =>
+      webhookFieldsFrom(config({ webhook_signature_scheme: stored }))
+    expect(webhookFieldsDiffer(seed, reread(null))).toBe(false)
+    expect(webhookFieldsDiffer(seed, reread('legacy'))).toBe(true)
+  })
+
+  it('ignores a change to the effective scheme alone', () => {
+    const after = webhookFieldsFrom(
+      config({ webhook_signature_scheme: '', effective_webhook_signature_scheme: 'invalid' }),
+    )
+    expect(webhookFieldsDiffer(seed, after)).toBe(false)
+  })
+
+  it('counts a scheme-only change as an edit', () => {
+    const untouched = {
+      url: seed.url,
+      events: seed.events,
+      insecureSkipVerify: seed.insecureSkipVerify,
+      headerName: seed.headerName,
+      replacementSecret: '',
+      mode: 'inherit' as const,
+      scheme: seed.scheme,
+    }
+    expect(webhookFormEdited(seed, untouched)).toBe(false)
+    expect(webhookFormEdited(seed, { ...untouched, scheme: 'agent_hmac_v1' })).toBe(true)
+  })
+})
+
+describe('"currently sent" cannot contradict the server (AC-14, TC-11)', () => {
+  const signed = { headerName: 'X-Hub-Signature-256', mode: 'signed' as const }
+
+  it('describes v1 as an HMAC of the signed string', () => {
+    expect(effectiveSummary(signed, 'agent_hmac_v1').text).toContain(AGENT_HMAC_V1_SIGNED_STRING)
+  })
+
+  it('keeps the legacy wording for legacy and for a server that reports no scheme', () => {
+    expect(effectiveSummary(signed, 'legacy').text).toMatch(/HMAC of the body/)
+    expect(effectiveSummary(signed, null).text).toMatch(/HMAC of the body/)
+    expect(effectiveSummary({ headerName: 'Authorization', mode: 'plain' }, null).text).toMatch(
+      /verbatim/,
+    )
+  })
+
+  it('says nothing is sent under invalid, and describes nothing it does not know', () => {
+    const invalid = effectiveSummary(signed, 'invalid')
+    expect(invalid.headerName).toBeNull()
+    expect(invalid.text).toMatch(/Nothing is being sent/)
+    const unknown = effectiveSummary(signed, 'unrecognised')
+    expect(unknown.headerName).toBeNull()
+    expect(unknown.text).not.toMatch(/HMAC/)
+    expect(effectiveSummary(null, null).text).toBe(EFFECTIVE_UNKNOWN)
+  })
+})
+
+describe('the redacted failure points at what v1 can reject', () => {
+  it('names the secret and the scheme, and still quotes nothing', () => {
+    expect(WEBHOOK_SAVE_FAILED_REDACTED).toMatch(/secret, the signature scheme/)
   })
 })
