@@ -9,7 +9,7 @@ created_at: 2026-10-29
 updated_at: 2026-10-29
 links:
   clickup: "https://app.clickup.com/t/90182746553/z8pmx9pyre"
-  github: ""
+  github: "https://github.com/yazan-alaa-ali-dev/go-Taxi24-ui/pull/18"
 ---
 
 # Ticket: 15 · Device webhook — choose the signature scheme and see the effective scheme
