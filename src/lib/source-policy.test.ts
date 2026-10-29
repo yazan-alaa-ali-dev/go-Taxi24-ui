@@ -923,10 +923,16 @@ describe('the account devices surface joins on the rows and pays no per-row cost
       /value=\{secretToSend\}|toast[^\n]*\bsecretToSend\b|`[^`]*\$\{secretToSend\}/.test(dialog),
       'the secret to be sent is neither bound to an input nor written into a message',
     ).toBe(false)
-    expect(
-      /`[^`]*\$\{(secret|secretToSend)\}/.test(sourceOf('src/lib/device-webhook.ts')),
-      'no validator or warning interpolates the secret it was given',
-    ).toBe(false)
+    // z8pmx9pyrj: widened from the bare `${secret}` to any interpolated
+    // expression naming a secret — `${args.secretToSend}`, `${f(storedSecret)}`.
+    const interpolatesSecret =
+      /\$\{[^}]*\b(secret|secretToSend|replacementSecret|storedSecret)\b[^}]*\}/
+    for (const path of ['src/lib/device-webhook.ts', WEBHOOK_DIALOG]) {
+      expect(
+        interpolatesSecret.test(sourceOf(path)),
+        `${path}: no validator, warning or message interpolates the secret`,
+      ).toBe(false)
+    }
     expect(dialog, 'a failed save is classified before anything is rendered').toMatch(
       /webhookSaveFailure\(error\)/,
     )
@@ -2033,9 +2039,7 @@ describe('the debug toggle spends a secret it must never hold (z8pmx9mw2x)', () 
         `${DIALOG}: ${banned.source} has no place in a fire-and-report action`,
       ).toBe(false)
     }
-    expect(dialog, `${DIALOG}: TanStack must not re-send a refused toggle`).toMatch(
-      /retry: false/,
-    )
+    expect(dialog, `${DIALOG}: TanStack must not re-send a refused toggle`).toMatch(/retry: false/)
     // The one timer this feature owns: it forgets a reported expiry, and it is
     // cleaned up. Its delay is decided by the pure `expiryDelay`, not here.
     expect(dialog).toContain('expiryDelay(')
@@ -2150,6 +2154,47 @@ describe('the signature scheme re-reads what it changed and alarms every viewer 
     const dialog = sourceOf(WEBHOOK_DIALOG)
     expect(dialog).toMatch(/<SchemeInvalidWarning\b/)
     expect(/mayWrite\s*&&\s*(\(\s*)?<SchemeInvalidWarning/.test(dialog)).toBe(false)
+  })
+
+  it('RULE: a failed save is matched to a field or redacted — never read for its text (z8pmx9pyrj)', () => {
+    // AC-8, AC-11. A catalogued 400 is answered with this app's sentence; the
+    // rest is redacted. Scoped to the save's own block, and the dialog may not
+    // touch `toApiError` at all: destructuring `message` off it would pass a
+    // rule that only looked for `.message`.
+    const dialog = sourceOf(WEBHOOK_DIALOG)
+    const save = /const save = useMutation\(\{([\s\S]*?)const toggle = useMutation/.exec(dialog)
+    expect(save).toBeTruthy()
+    expect(save![1]).toMatch(
+      /onError:[\s\S]*webhookRejectionFrom\(error\)[\s\S]*webhookSaveFailure\(error\)/,
+    )
+    expect(/\btoApiError\b/.test(dialog), 'classify through @/lib/device-webhook').toBe(false)
+  })
+
+  it('RULE: Save never sends a scheme switch; only the confirmation does (z8pmx9pyrj)', () => {
+    // AC-1, AC-15. Inside onSubmit the switch check returns before the one
+    // send, so a double-click on Save or Enter in a field cannot confirm. The
+    // confirm handler re-checks the shown panel, the block and the pending save.
+    const dialog = sourceOf(WEBHOOK_DIALOG)
+    const submit = /const onSubmit = \(event: FormEvent\) => \{([\s\S]*?)\n {2}\}\n/.exec(dialog)
+    expect(submit).toBeTruthy()
+    const body = submit![1]
+    const check = body.search(/if \(schemeSwitch\) \{\s*setConfirmingScheme\(true\)\s*return/)
+    expect(check, 'onSubmit opens the confirmation and returns').toBeGreaterThan(-1)
+    expect(body.indexOf('save.mutate()')).toBeGreaterThan(check)
+    const confirm = /const confirmSwitch = \(\) => \{([\s\S]*?)\n {2}\}\n/.exec(dialog)
+    expect(confirm).toBeTruthy()
+    expect(confirm![1]).toMatch(
+      /if \(!showSwitch \|\| blocked \|\| save\.isPending\) return[\s\S]*save\.mutate\(\)/,
+    )
+    expect(dialog).toMatch(/disabled=\{blocked \|\| save\.isPending\}/)
+  })
+
+  it('RULE: closing the dialog drops the confirmation and the rejection (z8pmx9pyrj)', () => {
+    // AC-4, AC-10. A stale confirmation must not re-appear on the next open.
+    const close = /if \(!open\) \{([\s\S]*?)\}\n {2}\}, \[open\]\)/.exec(sourceOf(WEBHOOK_DIALOG))
+    expect(close).toBeTruthy()
+    expect(close![1]).toContain('setConfirmingScheme(false)')
+    expect(close![1]).toContain('setRejection(null)')
   })
 
   it('RULE: no secret crosses into the authentication section', () => {

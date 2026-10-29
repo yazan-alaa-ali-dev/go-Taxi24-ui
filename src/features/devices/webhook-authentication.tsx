@@ -1,4 +1,5 @@
 import { AlertTriangle } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -19,6 +20,7 @@ import {
   schemeOptionLabel,
   type EffectiveAuth,
   type EffectiveScheme,
+  type SchemeSwitchCopy,
   type WebhookAuthMode,
   type WebhookScheme,
   type WebhookSchemeState,
@@ -48,6 +50,58 @@ export function SchemeInvalidWarning({ effective }: { effective: EffectiveScheme
 }
 
 /**
+ * The confirmation a scheme switch waits on (z8pmx9pyrj).
+ *
+ * The only control that sends a switch: the form's own submit never does, so a
+ * double-click on Save or Enter in a field cannot confirm. Both buttons are
+ * `type="button"` for the same reason. `role="alert"` announces it when it
+ * appears. Every string arrives built by `@/lib/device-webhook`.
+ */
+export function SchemeSwitchConfirmation({
+  copy,
+  disabled,
+  onCancel,
+  onConfirm,
+}: {
+  copy: SchemeSwitchCopy
+  /** Blocked form, or the save already in flight. */
+  disabled: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <div
+      role="alert"
+      className="border-destructive flex flex-col gap-2 rounded-lg border p-3 text-xs"
+    >
+      <p className="text-destructive flex items-center gap-2 text-sm font-medium">
+        <AlertTriangle className="size-4 shrink-0" />
+        {copy.title}
+      </p>
+      <ul className="flex list-disc flex-col gap-1 pl-4">
+        {copy.lines.map((line) => (
+          <li key={line}>{line}</li>
+        ))}
+      </ul>
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button type="button" size="sm" variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="destructive"
+          disabled={disabled}
+          onClick={onConfirm}
+        >
+          {copy.action}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/**
  * How the device's webhook proves itself to the receiver: the signature scheme,
  * then either the fixed Agent HMAC v1 contract or the legacy mode and header.
  *
@@ -69,6 +123,7 @@ export function WebhookAuthentication({
   mode,
   headerName,
   mayWrite,
+  schemeError,
   headerNameError,
   authError,
   notices,
@@ -85,6 +140,8 @@ export function WebhookAuthentication({
   mode: WebhookAuthMode
   headerName: string
   mayWrite: boolean
+  /** A server rejection naming the scheme; never blocking. */
+  schemeError: string | null
   headerNameError: string | null
   authError: string | null
   /** Warnings shown beneath the controls in force; never blocking. */
@@ -109,7 +166,7 @@ export function WebhookAuthentication({
             onValueChange={(next) => onSchemeChange(next as WebhookScheme)}
             disabled={!mayWrite}
           >
-            <SelectTrigger id="device-webhook-scheme">
+            <SelectTrigger id="device-webhook-scheme" aria-invalid={schemeError !== null}>
               <SelectValue placeholder={SCHEME_UNRECOGNISED_PLACEHOLDER} />
             </SelectTrigger>
             <SelectContent>
@@ -120,14 +177,15 @@ export function WebhookAuthentication({
               ))}
             </SelectContent>
           </Select>
+          {schemeError && <p className="text-destructive text-xs">{schemeError}</p>}
         </div>
       )}
 
       {v1 ? (
         <div className="bg-muted/40 flex flex-col gap-2 rounded-md p-3 text-xs">
           <p>
-            Every delivery carries three fixed headers. The header name and mode are not used
-            under this scheme.
+            Every delivery carries three fixed headers. The header name and mode are not used under
+            this scheme.
           </p>
           <ul className="flex list-disc flex-col gap-0.5 pl-4">
             <li>the signature header — its name is shown under “Currently sent” once saved</li>

@@ -1,7 +1,11 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { AGENT_HMAC_V1_SIGNED_STRING, SCHEME_UNRECOGNISED_PLACEHOLDER } from '@/lib/device-webhook'
-import { SchemeInvalidWarning, WebhookAuthentication } from './webhook-authentication'
+import {
+  SchemeInvalidWarning,
+  SchemeSwitchConfirmation,
+  WebhookAuthentication,
+} from './webhook-authentication'
 
 /**
  * A real render, asserted on real markup (ticket z8pmx9pyre).
@@ -30,6 +34,7 @@ function render(overrides: Partial<Parameters<typeof WebhookAuthentication>[0]> 
       mode="signed"
       headerName=""
       mayWrite
+      schemeError={null}
       headerNameError={null}
       authError={null}
       notices={[]}
@@ -115,5 +120,63 @@ describe('the summary under the controls follows the server (AC-14)', () => {
     expect(render({ notices: ['A notice about the default.'] })).toContain(
       'A notice about the default.',
     )
+  })
+})
+
+describe('the scheme-switch confirmation sends only from its own button (AC-1, AC-15, TC-3, TC-12)', () => {
+  const copy = {
+    title: 'Switch this device to Agent HMAC v1?',
+    lines: ['First consequence.', 'Second consequence.'],
+    action: 'Switch to Agent HMAC v1 and save',
+  }
+
+  function confirmation(disabled: boolean): string {
+    return renderToStaticMarkup(
+      <SchemeSwitchConfirmation copy={copy} disabled={disabled} onCancel={noop} onConfirm={noop} />,
+    )
+  }
+
+  it('is announced, lists every line, and offers Cancel and the named action', () => {
+    const html = confirmation(false)
+    expect(html).toContain('role="alert"')
+    expect(html).toContain(copy.title)
+    for (const line of copy.lines) expect(html).toContain(`<li>${line}</li>`)
+    expect(html).toContain('>Cancel</button>')
+    expect(html).toContain(copy.action)
+  })
+
+  it('has no submit button: neither button can be reached by the form’s own submit', () => {
+    const html = confirmation(false)
+    expect(html.match(/<button/g)).toHaveLength(2)
+    expect(html.match(/type="button"/g)).toHaveLength(2)
+    expect(html).not.toContain('type="submit"')
+  })
+
+  it('disables Confirm when told — a blocked form or a save in flight — and never Cancel', () => {
+    const html = confirmation(true)
+    expect(html.match(/disabled=""/g)).toHaveLength(1)
+    expect(html).toMatch(/disabled=""[^>]*>Switch to Agent HMAC v1 and save/)
+    expect(confirmation(false)).not.toContain('disabled=""')
+  })
+})
+
+describe('a scheme rejection is shown under the select (AC-8, AC-9)', () => {
+  it('renders the sentence and marks the select invalid', () => {
+    const html = render({ schemeError: 'The server did not accept this signature scheme.' })
+    expect(html).toContain('The server did not accept this signature scheme.')
+    expect(html).toMatch(
+      /id="device-webhook-scheme"[^>]*aria-invalid="true"|aria-invalid="true"[^>]*id="device-webhook-scheme"/,
+    )
+  })
+
+  it('has nowhere to render it when the server does not report the scheme', () => {
+    const html = render({
+      scheme: 'unreported',
+      seededScheme: 'unreported',
+      effectiveScheme: null,
+      schemeError: 'The server did not accept this signature scheme.',
+    })
+    // The dialog places it beside Save instead (rejectionShownAt).
+    expect(html).not.toContain('The server did not accept this signature scheme.')
   })
 })
