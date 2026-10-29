@@ -15,30 +15,25 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useHasPermission } from '@/hooks/use-permissions'
 import {
-  AUTH_MODE_LABELS,
   CLEARS_WEBHOOK_WARNING,
   DISABLED_MEANS,
-  EFFECTIVE_UNKNOWN,
   ENABLING_RESUMES,
   INSECURE_SKIP_VERIFY_MEANS,
   WEBHOOK_EVENTS,
   WEBHOOK_SAVE_FAILED_REDACTED,
   authModeFrom,
   effectiveAuthFrom,
+  effectiveSchemeFrom,
   inheritedPlainWarning,
+  inheritedV1Notice,
+  modeAfterSchemeChange,
   parseWebhookEvents,
   plainWarning,
   serializeWebhookEvents,
+  v1InForce,
   webhookEnabledFrom,
   webhookFieldsDiffer,
   webhookFieldsFrom,
@@ -50,12 +45,13 @@ import {
   webhookUrlNotice,
   type WebhookAuthMode,
   type WebhookFields,
+  type WebhookScheme,
+  type WebhookSchemeState,
 } from '@/lib/device-webhook'
 import { toActionErrorMessage } from '@/lib/auth-messages'
 import { PERMISSIONS } from '@/lib/permissions'
 import { deviceWebhookKey } from '@/lib/query-keys'
-
-const AUTH_MODES: WebhookAuthMode[] = ['inherit', 'signed', 'plain']
+import { SchemeInvalidWarning, WebhookAuthentication } from './webhook-authentication'
 
 /**
  * One device's webhook: where its events go, whether they go at all, and how
@@ -85,6 +81,13 @@ const AUTH_MODES: WebhookAuthMode[] = ['inherit', 'signed', 'plain']
  * would otherwise put back a secret that was just rotated elsewhere. Every
  * decision behind that is in `@/lib/device-webhook`, where it is tested.
  *
+ * **The signature scheme decides which controls exist** (z8pmx9pyre). Under
+ * Agent HMAC v1 — chosen, or inherited and reported — the mode and header are
+ * ignored by the server, so they are not rendered and are sent as their reset
+ * value; leaving v1 sets the mode to Signed so the way back cannot land on a
+ * verbatim secret. An `invalid` effective scheme means the server has stopped
+ * every delivery, and that is said in red to every viewer.
+ *
  * Identified by id rather than by a `RegistryDevice`, because an account device
  * row may have no registry entry at all and manufacturing one would be the
  * invented row the account devices surface refuses.
@@ -113,6 +116,7 @@ export function DeviceWebhookDialog({
   const [insecureSkipVerify, setInsecureSkipVerify] = useState(false)
   const [headerName, setHeaderName] = useState('')
   const [mode, setMode] = useState<WebhookAuthMode>('inherit')
+  const [scheme, setScheme] = useState<WebhookSchemeState>('unreported')
   // What the form was filled from. `null` until this open's first read settles.
   const [seed, setSeed] = useState<WebhookFields | null>(null)
   const [changedElsewhere, setChangedElsewhere] = useState(false)
@@ -140,6 +144,7 @@ export function DeviceWebhookDialog({
       headerName,
       replacementSecret,
       mode,
+      scheme,
     })
 
   const fill = (fields: WebhookFields) => {
@@ -152,6 +157,7 @@ export function DeviceWebhookDialog({
     setInsecureSkipVerify(fields.insecureSkipVerify)
     setHeaderName(fields.headerName)
     setMode(authModeFrom(fields.sign))
+    setScheme(fields.scheme)
     setSeed(fields)
     setChangedElsewhere(false)
     setConfirmingClear(false)
@@ -204,6 +210,8 @@ export function DeviceWebhookDialog({
           insecureSkipVerify,
           headerName,
           mode,
+          scheme,
+          v1,
         }),
       ),
     onSuccess: () => {
@@ -235,11 +243,18 @@ export function DeviceWebhookDialog({
     onError: (error) => setFailure(toActionErrorMessage(error)),
   })
 
+  const effective = config.data ? effectiveAuthFrom(config.data) : null
+  const effectiveScheme = config.data ? effectiveSchemeFrom(config.data) : null
+  const seededScheme = seed?.scheme ?? 'unreported'
+  const v1 = v1InForce(scheme, seededScheme, effectiveScheme)
+
   const secretToSend = replacementSecret === '' ? secret : replacementSecret
   const errors = webhookFormErrors({
     url,
     headerName,
     mode,
+    scheme,
+    v1,
     replacementSecret,
     storedSecret: secret,
   })
@@ -266,12 +281,22 @@ export function DeviceWebhookDialog({
       checked ? [...current, name] : current.filter((event) => event !== name),
     )
 
+  const onSchemeChange = (next: WebhookScheme) => {
+    // Leaving v1 lands on Signed, in the same update, so the mode the operator
+    // sees is the one that is sent.
+    setMode(modeAfterSchemeChange(v1, v1InForce(next, seededScheme, effectiveScheme), mode))
+    setScheme(next)
+  }
+
   const delivery = config.data ? webhookEnabledFrom(config.data) : null
-  const effective = config.data ? effectiveAuthFrom(config.data) : null
   const urlNotice = webhookUrlNotice(url)
   const clearing = webhookSaveEffect(url) === 'clear'
-  const plainNotice = plainWarning(mode, url)
-  const inheritedPlainNotice = inheritedPlainWarning(mode, effective, secretToSend)
+  // The legacy notices describe controls that do not exist under v1.
+  const authNotices = (
+    v1
+      ? [inheritedV1Notice(scheme, v1, replacementSecret, secret)]
+      : [plainWarning(mode, url), inheritedPlainWarning(mode, effective, secretToSend)]
+  ).filter((notice): notice is string => notice !== null)
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -324,6 +349,8 @@ export function DeviceWebhookDialog({
                 <p className="text-muted-foreground text-xs">{ENABLING_RESUMES}</p>
               </div>
             )}
+
+            <SchemeInvalidWarning effective={effectiveScheme} />
 
             {changedElsewhere && (
               <div className="border-destructive text-destructive flex flex-col gap-2 rounded-lg border p-3 text-xs">
@@ -382,6 +409,7 @@ export function DeviceWebhookDialog({
                     />
                     <p className="text-muted-foreground text-xs">
                       Signed mode uses it as the HMAC key; Plain mode sends it as the header value.
+                      Agent HMAC v1 uses it as the HMAC key and needs at least 32 characters.
                       Leave this empty to keep the one already stored. Copy a new value now — it is
                       not shown again.
                     </p>
@@ -390,67 +418,22 @@ export function DeviceWebhookDialog({
                 {errors.secret && <p className="text-destructive text-xs">{errors.secret}</p>}
               </div>
 
-              <div className="flex flex-col gap-3 rounded-lg border p-3">
-                <p className="text-sm font-medium">Authentication</p>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="device-webhook-mode">Mode</Label>
-                  <Select
-                    value={mode}
-                    onValueChange={(next) => setMode(next as WebhookAuthMode)}
-                    disabled={!mayWrite}
-                  >
-                    <SelectTrigger id="device-webhook-mode">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {AUTH_MODES.map((option) => (
-                        <SelectItem key={option} value={option}>
-                          {AUTH_MODE_LABELS[option]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  {errors.auth && <p className="text-destructive text-xs">{errors.auth}</p>}
-                  {plainNotice && <p className="text-destructive text-xs">{plainNotice}</p>}
-                  {inheritedPlainNotice && (
-                    <p className="text-destructive text-xs">{inheritedPlainNotice}</p>
-                  )}
-                </div>
-
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="device-webhook-header">Header name</Label>
-                  <Input
-                    id="device-webhook-header"
-                    placeholder="empty inherits the server default"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={headerName}
-                    onChange={(event) => setHeaderName(event.target.value)}
-                    readOnly={!mayWrite}
-                    aria-invalid={errors.headerName !== null}
-                  />
-                  {errors.headerName && (
-                    <p className="text-destructive text-xs">{errors.headerName}</p>
-                  )}
-                </div>
-
-                {/* What the server says it will send, after inheritance. Never
-                    filled in from a guessed default. */}
-                <p className="text-muted-foreground text-xs">
-                  {effective ? (
-                    <>
-                      Currently sent: header{' '}
-                      <span className="text-foreground font-mono">{effective.headerName}</span>,{' '}
-                      {effective.mode === 'signed'
-                        ? 'signed (sha256= HMAC of the body)'
-                        : 'plain (the secret verbatim)'}
-                      . This reflects the last saved configuration.
-                    </>
-                  ) : (
-                    EFFECTIVE_UNKNOWN
-                  )}
-                </p>
-              </div>
+              <WebhookAuthentication
+                scheme={scheme}
+                seededScheme={seededScheme}
+                effectiveScheme={effectiveScheme}
+                effectiveAuth={effective}
+                v1={v1}
+                mode={mode}
+                headerName={headerName}
+                mayWrite={mayWrite}
+                headerNameError={errors.headerName}
+                authError={errors.auth}
+                notices={authNotices}
+                onSchemeChange={onSchemeChange}
+                onModeChange={setMode}
+                onHeaderNameChange={setHeaderName}
+              />
 
               <div className="flex flex-col gap-2">
                 <p className="text-sm font-medium">Events</p>

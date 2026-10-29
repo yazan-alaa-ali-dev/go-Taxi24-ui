@@ -1,4 +1,9 @@
-import type { DeviceWebhookConfig, UpdateDeviceWebhookPayload, WebhookSign } from '@/api/devices'
+import type {
+  DeviceWebhookConfig,
+  UpdateDeviceWebhookPayload,
+  WebhookSign,
+  WebhookSignatureScheme,
+} from '@/api/devices'
 import { toApiError } from '@/lib/api-error'
 
 /**
@@ -158,6 +163,11 @@ export function webhookEnabledFrom(config: DeviceWebhookConfig): {
  * URL, the secret and the event list; leaving a custom header and mode behind
  * would make the "reset" partial, so the clear case sends `null` for both —
  * the full reset the reference gives as its own example.
+ *
+ * **Under Agent HMAC v1 the hidden controls send their reset value** (z8pmx9pyre).
+ * The server ignores the header name and refuses an explicit `webhook_sign:
+ * false`; a control the operator cannot see contributes nothing to the body.
+ * The scheme key itself follows `schemeKeyPayload`.
  */
 export function webhookPayloadFrom(fields: {
   url: string
@@ -166,21 +176,27 @@ export function webhookPayloadFrom(fields: {
   insecureSkipVerify: boolean
   headerName: string
   mode: WebhookAuthMode
+  scheme: WebhookSchemeState
+  /** `v1InForce(...)` for this form. */
+  v1: boolean
 }): UpdateDeviceWebhookPayload {
   const clearing = webhookSaveEffect(fields.url) === 'clear'
-  return {
+  const resetAuth = clearing || fields.v1
+  const payload: UpdateDeviceWebhookPayload = {
     webhook_url: fields.url.trim(),
     webhook_secret: fields.secret,
     webhook_events: fields.events.trim(),
     webhook_insecure_skip_verify: fields.insecureSkipVerify,
-    webhook_header_name: clearing ? null : headerNamePayload(fields.headerName),
-    webhook_sign: clearing ? null : signFrom(fields.mode),
+    webhook_header_name: resetAuth ? null : headerNamePayload(fields.headerName),
+    webhook_sign: resetAuth ? null : signFrom(fields.mode),
   }
+  const scheme = schemeKeyPayload(fields.scheme, clearing)
+  return scheme === undefined ? payload : { ...payload, webhook_signature_scheme: scheme }
 }
 
 /** The sentence a failed save gets when the server's own text may not be shown. */
 export const WEBHOOK_SAVE_FAILED_REDACTED =
-  'The webhook was not saved. The server’s reason is not shown here because this request carried the signing secret, and a rejection can quote the field it rejected. Check the URL, the header name and the event list and try again.'
+  'The webhook was not saved. The server’s reason is not shown here because this request carried the signing secret, and a rejection can quote the field it rejected. Check the URL, the secret, the signature scheme, the header name and the event list and try again.'
 
 /**
  * May the server's own text be rendered for this failure?
@@ -384,6 +400,233 @@ export function inheritedPlainWarning(
 
 /*
  * ---------------------------------------------------------------------------
+ * Signature scheme: which wire contract the delivery follows (z8pmx9pyre).
+ *
+ * A third axis on top of mode and header. Under `agent_hmac_v1` the mode and
+ * header are ignored and three fixed headers carry an HMAC over
+ * `timestamp.request_id.raw_body` — replay protection `legacy` does not have.
+ *
+ * The stored field reaches this module in four states, not three: the three
+ * choices, plus *absent* (a server predating the field — the UI then offers no
+ * control and sends no key, byte-identical to before) and *a value this UI does
+ * not know* (a newer server — the key is omitted on an unrelated save, because
+ * it is absent-preserving and omitting it is the one body that cannot overwrite
+ * what it does not understand).
+ * ---------------------------------------------------------------------------
+ */
+
+export type WebhookScheme = 'inherit' | 'legacy' | 'agent_hmac_v1'
+/** What the form holds: one of the choices, or a stored state it cannot offer. */
+export type WebhookSchemeState = WebhookScheme | 'unreported' | 'unrecognised'
+/** What the server says it will use. `invalid` means every delivery is stopped. */
+export type EffectiveScheme = 'legacy' | 'agent_hmac_v1' | 'invalid' | 'unrecognised'
+
+export const SCHEME_OPTIONS: readonly WebhookScheme[] = ['inherit', 'legacy', 'agent_hmac_v1']
+
+const SCHEME_LABELS: Record<WebhookScheme, string> = {
+  inherit: 'Inherit',
+  legacy: 'Legacy',
+  agent_hmac_v1: 'Agent HMAC v1',
+}
+
+export const SCHEME_UNRECOGNISED_PLACEHOLDER = 'Unrecognised — kept as stored'
+
+export function schemeFrom(stored: string | null | undefined): WebhookSchemeState {
+  if (stored === undefined) return 'unreported'
+  if (stored === null || stored === '') return 'inherit'
+  if (stored === 'legacy' || stored === 'agent_hmac_v1') return stored
+  return 'unrecognised'
+}
+
+/**
+ * The scheme key of the body: `undefined` means "omit it".
+ *
+ * A server that does not report the field gets no key at all, deletion
+ * included. An unrecognised stored value is kept on an unrelated save, but a
+ * deletion is not an unrelated save — it is the full reset, so it sends `null`.
+ */
+function schemeKeyPayload(
+  scheme: WebhookSchemeState,
+  clearing: boolean,
+): WebhookSignatureScheme | null | undefined {
+  if (scheme === 'unreported') return undefined
+  if (clearing) return null
+  if (scheme === 'unrecognised') return undefined
+  return scheme === 'inherit' ? null : scheme
+}
+
+/**
+ * The scheme the server reports as effective, or `null` when it reported none.
+ * An unknown string is kept apart from absent: it raises no alarm, and it is
+ * not described as either known scheme.
+ */
+export function effectiveSchemeFrom(config: DeviceWebhookConfig): EffectiveScheme | null {
+  const value = config.effective_webhook_signature_scheme
+  if (typeof value !== 'string' || value === '') return null
+  if (value === 'legacy' || value === 'agent_hmac_v1' || value === 'invalid') return value
+  return 'unrecognised'
+}
+
+/**
+ * An option's label. Inherit names what it currently resolves to **only when
+ * the device inherits**: the effective value is the device's own, so beside an
+ * explicit choice it says nothing about the deployment default. `invalid` is
+ * not named here — the alert says it — and neither is a value this UI does not
+ * know.
+ */
+export function schemeOptionLabel(
+  option: WebhookScheme,
+  seeded: WebhookSchemeState,
+  effective: EffectiveScheme | null,
+): string {
+  if (
+    option === 'inherit' &&
+    seeded === 'inherit' &&
+    (effective === 'legacy' || effective === 'agent_hmac_v1')
+  ) {
+    return `Inherit (currently: ${effective})`
+  }
+  return SCHEME_LABELS[option]
+}
+
+/**
+ * Is Agent HMAC v1 the contract this form would be saved under?
+ *
+ * Chosen explicitly, or Inherit on a device that already inherits and whose
+ * server said that resolves to v1. The seed rather than the live select,
+ * because the effective value describes the last saved configuration.
+ */
+export function v1InForce(
+  form: WebhookSchemeState,
+  seeded: WebhookSchemeState,
+  effective: EffectiveScheme | null,
+): boolean {
+  if (form === 'agent_hmac_v1') return true
+  return form === 'inherit' && seeded === 'inherit' && effective === 'agent_hmac_v1'
+}
+
+/**
+ * The mode after a scheme change.
+ *
+ * **Leaving v1 lands on Signed.** Under v1 the mode is sent as `null`, so the
+ * way back would otherwise seed Inherit — and with a deployment default of
+ * plain, the device's 32-character HMAC key would then go out verbatim in a
+ * header. The reference's own instruction for returning is an explicit signed
+ * mode. Set here, visibly, where the operator can still change it.
+ */
+export function modeAfterSchemeChange(
+  wasV1: boolean,
+  isV1: boolean,
+  mode: WebhookAuthMode,
+): WebhookAuthMode {
+  return wasV1 && !isV1 ? 'signed' : mode
+}
+
+/**
+ * The two headers v1 adds beside its signature header. The signature header
+ * itself is described, never spelled: `source-policy.test.ts` keeps its name
+ * out of the bundle (z8pmx9mw2x), and the dialog shows it only as the server
+ * reports it, in `effective_webhook_header_name`.
+ */
+export const AGENT_HMAC_V1_HEADERS = ['X-Agent-Timestamp', 'X-Agent-Request-Id'] as const
+export const AGENT_HMAC_V1_SIGNED_STRING = 'timestamp.request_id.raw_body'
+export const AGENT_HMAC_V1_SECRET_MIN = 32
+/** The value the server ships as its default secret, refused as a v1 key. */
+const PLACEHOLDER_SECRET = 'secret'
+
+const AGENT_SECRET_REQUIRED = `Agent HMAC v1 needs a secret of its own for this device, at least ${AGENT_HMAC_V1_SECRET_MIN} characters long. Enter one, or choose another scheme.`
+const AGENT_SECRET_PLACEHOLDER = {
+  replacement:
+    'This is the placeholder value the server ships with, which Agent HMAC v1 refuses. Enter a real secret.',
+  stored:
+    'The secret stored for this device is the placeholder value the server ships with, which Agent HMAC v1 refuses. Enter a replacement to save.',
+}
+const AGENT_SECRET_SHORT = {
+  replacement: `An Agent HMAC v1 secret must be at least ${AGENT_HMAC_V1_SECRET_MIN} characters long, not counting spaces at either end.`,
+  stored: `The secret stored for this device is shorter than the ${AGENT_HMAC_V1_SECRET_MIN} characters Agent HMAC v1 requires. Enter a replacement to save.`,
+}
+
+/**
+ * Why this secret cannot be an Agent HMAC v1 key, or `null`.
+ *
+ * The rules the browser can check; the server's `AGENT_CALLBACK_KEY` rule it
+ * cannot. The server keys the HMAC on the **trimmed** secret, so both checks
+ * run on it. The placeholder check comes first, or `" secret "` would be told
+ * it is too short. Length is counted in code points — the smallest of the
+ * counts a server might use — so nothing passes here that a server refuses.
+ * Every message is a constant: none names the secret or any part of it.
+ */
+export function agentSecretError(secret: string, source: 'replacement' | 'stored'): string | null {
+  const key = secret.trim()
+  if (key === '') return AGENT_SECRET_REQUIRED
+  if (key === PLACEHOLDER_SECRET) return AGENT_SECRET_PLACEHOLDER[source]
+  if ([...key].length < AGENT_HMAC_V1_SECRET_MIN) return AGENT_SECRET_SHORT[source]
+  return null
+}
+
+/**
+ * Inherit resolving to v1, with a secret v1 would refuse: not a refusal —
+ * inheriting is the deployment's policy — but the operator is told that the
+ * save leaves this device's delivery stopped.
+ */
+export function inheritedV1Notice(
+  scheme: WebhookSchemeState,
+  v1: boolean,
+  replacementSecret: string,
+  storedSecret: string,
+): string | null {
+  if (scheme !== 'inherit' || !v1) return null
+  const replacing = replacementSecret !== ''
+  const reason = agentSecretError(
+    replacing ? replacementSecret : storedSecret,
+    replacing ? 'replacement' : 'stored',
+  )
+  return reason === null
+    ? null
+    : `The server default for this device is Agent HMAC v1, so with this secret its delivery stays stopped. ${reason}`
+}
+
+export const SCHEME_INVALID_WARNING =
+  'The server reports this device’s signature configuration as invalid, so no events are delivered for this device until the configuration is fixed. Someone allowed to change this webhook must correct the signature scheme or the secret.'
+
+/**
+ * The "currently sent" line: a header to name, and the sentence after it.
+ *
+ * One arm per thing the server can report, so the line cannot contradict the
+ * alert above it: under `invalid` nothing is sent, and a scheme this UI does
+ * not know is not described as one it does.
+ */
+export function effectiveSummary(
+  auth: EffectiveAuth | null,
+  scheme: EffectiveScheme | null,
+): { headerName: string | null; text: string } {
+  if (scheme === 'invalid') {
+    return {
+      headerName: null,
+      text: 'Nothing is being sent for this device: the server reports its signature configuration as invalid.',
+    }
+  }
+  if (scheme === 'unrecognised') {
+    return {
+      headerName: null,
+      text: 'This server reports a signature scheme this dialog does not know, so what it sends is not described here.',
+    }
+  }
+  if (auth === null) return { headerName: null, text: EFFECTIVE_UNKNOWN }
+  const how =
+    scheme === 'agent_hmac_v1'
+      ? `signed under Agent HMAC v1 (sha256= HMAC of ${AGENT_HMAC_V1_SIGNED_STRING}, with X-Agent-Timestamp and X-Agent-Request-Id)`
+      : auth.mode === 'signed'
+        ? 'signed (sha256= HMAC of the body)'
+        : 'plain (the secret verbatim)'
+  return {
+    headerName: auth.headerName,
+    text: `${how}. This reflects the last saved configuration.`,
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Events: a fixed catalogue, and the stored names it does not know.
  * ---------------------------------------------------------------------------
  */
@@ -454,7 +697,7 @@ export function serializeWebhookEvents(
  * The dialog fills its form once per open. A later read — the dialog's own
  * delivery toggle, or another operator's save broadcast over the WebSocket —
  * must neither overwrite an edit in progress nor raise an alarm about a change
- * that touched nothing on the form. So the comparison covers the six
+ * that touched nothing on the form. So the comparison covers the seven
  * configuration fields and nothing else: `webhook_enabled` and `effective_*`
  * are not on the form.
  * ---------------------------------------------------------------------------
@@ -467,6 +710,7 @@ export interface WebhookFields {
   insecureSkipVerify: boolean
   headerName: string
   sign: WebhookSign
+  scheme: WebhookSchemeState
 }
 
 export function webhookFieldsFrom(config: DeviceWebhookConfig): WebhookFields {
@@ -477,6 +721,7 @@ export function webhookFieldsFrom(config: DeviceWebhookConfig): WebhookFields {
     insecureSkipVerify: config.webhook_insecure_skip_verify,
     headerName: headerNameFrom(config.webhook_header_name),
     sign: config.webhook_sign ?? null,
+    scheme: schemeFrom(config.webhook_signature_scheme),
   }
 }
 
@@ -489,7 +734,8 @@ export function webhookFieldsDiffer(a: WebhookFields, b: WebhookFields): boolean
       serializeWebhookEvents(...eventsOf(b.events)) ||
     a.insecureSkipVerify !== b.insecureSkipVerify ||
     a.headerName.trim() !== b.headerName.trim() ||
-    a.sign !== b.sign
+    a.sign !== b.sign ||
+    a.scheme !== b.scheme
   )
 }
 
@@ -520,6 +766,7 @@ export function webhookFormEdited(
       insecureSkipVerify: form.insecureSkipVerify,
       headerName: form.headerName,
       sign: signFrom(form.mode),
+      scheme: form.scheme,
     })
   )
 }
@@ -533,11 +780,19 @@ export function webhookFormEdited(
  * no credential configuration worth validating, and blocking it on a header the
  * deletion is about to reset would make the destructive path the only one that
  * cannot be completed.
+ *
+ * With Agent HMAC v1 in force the header name and mode are hidden and sent as
+ * their reset value, so neither is validated — an error the operator cannot see
+ * must not block the save. The secret's format rule still runs first; the v1
+ * key rules **block** only when v1 was chosen explicitly. An inherited v1 is the
+ * deployment's policy, and `inheritedV1Notice` says what it costs instead.
  */
 export function webhookFormErrors(fields: {
   url: string
   headerName: string
   mode: WebhookAuthMode
+  scheme: WebhookSchemeState
+  v1: boolean
   replacementSecret: string
   storedSecret: string
 }): { headerName: string | null; secret: string | null; auth: string | null } {
@@ -546,9 +801,19 @@ export function webhookFormErrors(fields: {
   }
   const replacing = fields.replacementSecret !== ''
   const secretToSend = replacing ? fields.replacementSecret : fields.storedSecret
+  const source = replacing ? 'replacement' : 'stored'
+  const format = secretError(secretToSend, source)
+  if (fields.v1) {
+    return {
+      headerName: null,
+      secret:
+        format ?? (fields.scheme === 'agent_hmac_v1' ? agentSecretError(secretToSend, source) : null),
+      auth: null,
+    }
+  }
   return {
     headerName: headerNameError(fields.headerName),
-    secret: secretError(secretToSend, replacing ? 'replacement' : 'stored'),
+    secret: format,
     auth: authSecretError(fields.mode, secretToSend),
   }
 }
